@@ -20,7 +20,18 @@ import mimetypes, os, uuid
 # ─────────────────────────────────────────────────────────────────
 
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "*"}})     # CORS for React
+
+if os.getenv("FLASK_ENV") == "development":
+    origins.append("http://localhost:5173")
+
+# PRODUCTION CORS: only front-end domains may access /api/*
+CORS(
+    app,
+    resources={r"/api/*": {"origins": [
+        "https://perkpdf.com",
+        "https://www.perkpdf.com"
+    ]}}
+)
 
 # ── config & housekeeping ───────────────────────────────────────
 app.config["UPLOAD_FOLDER"]      = "temp"
