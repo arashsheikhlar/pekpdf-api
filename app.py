@@ -106,4 +106,4 @@ def merge_pdfs():
 
 # ── run ──────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000, debug=True)   # change port if needed
+    app.run(host="0.0.0.0", port=8000)   # change port if needed
