@@ -18,6 +18,7 @@ from PyPDF2 import PdfMerger, PdfReader, PdfWriter   # ← PdfReader/Writer for 
 from datetime import datetime, timedelta
 import mimetypes, os, uuid
 import subprocess, shlex          # run Ghostscript
+import shutil, platform
 # ─────────────────────────────────────────────────────────────────
 
 app = Flask(__name__)
@@ -59,6 +60,29 @@ def allowed_pdf(fileobj):
     mime = fileobj.mimetype == "application/pdf"
     guess= mimetypes.guess_type(fileobj.filename)[0] == "application/pdf"
     return ext and mime and guess
+
+# -------------------------
+def gs_executable():
+    """Return full path to Ghostscript binary or None."""
+    # first, check PATH
+    exe = shutil.which("gs") or shutil.which("gswin64c") or shutil.which("gswin32c")
+    if exe:
+        return exe
+
+    # fallback: typical Windows install folder
+    win_dirs = [
+        r"D:\Program Files\gs",
+        r"D:\Program Files (x86)\gs",
+    ]
+    for root in win_dirs:
+        if os.path.isdir(root):
+            # pick highest version folder
+            versions = sorted(os.listdir(root), reverse=True)
+            for v in versions:
+                cand = os.path.join(root, v, "bin", "gswin64c.exe")
+                if os.path.isfile(cand):
+                    return cand
+    return None
 
 # ── ROUTES ───────────────────────────────────────────────────────
 @app.get("/")
@@ -211,17 +235,23 @@ def compress_pdf():
     out_path = os.path.join(app.config["UPLOAD_FOLDER"],
                             f"compressed_{uuid.uuid4()}.pdf")
 
+    
+    gs_bin = gs_executable()
+    if not gs_bin:
+        return jsonify(error="Ghostscript not installed"), 500
+    
     # Ghostscript command
-    gs_cmd = (
-        f"gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 "
-        f"-dPDFSETTINGS=/{quality} -dNOPAUSE -dQUIET -dBATCH "
-        f"-sOutputFile={shlex.quote(out_path)} {shlex.quote(in_path)}"
-    )
+    gs_cmd = [
+        gs_bin,
+        "-sDEVICE=pdfwrite",
+        "-dCompatibilityLevel=1.4",
+        f"-dPDFSETTINGS=/{quality}",
+        "-dNOPAUSE", "-dQUIET", "-dBATCH",
+        f"-sOutputFile={out_path}",
+        in_path,
+    ]
 
-    try:
-        subprocess.run(shlex.split(gs_cmd), check=True)
-    except subprocess.CalledProcessError:
-        return jsonify(error="Compression failed"), 500
+    subprocess.run(gs_cmd, check=True)
 
     # cleanup originals after send
     @after_this_request

@@ -1,4 +1,4 @@
 Flask
 PyPDF2
 flask-cors
-ghostscript
+ghostscript>=0.7
