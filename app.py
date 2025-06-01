@@ -14,7 +14,7 @@ from flask import (
 )
 from flask_cors import CORS                 # allow front-end origin
 from werkzeug.utils import secure_filename
-from PyPDF2 import PdfMerger
+from PyPDF2 import PdfMerger, PdfReader, PdfWriter   # ← PdfReader/Writer for split
 from datetime import datetime, timedelta
 import mimetypes, os, uuid
 # ─────────────────────────────────────────────────────────────────
@@ -114,6 +114,74 @@ def merge_pdfs():
         download_name="merged.pdf",
         mimetype="application/pdf",
     )
+
+
+# ── SPLIT (NEW) ───────────────────────────────────────────
+@app.post("/api/split")
+def split_pdf():
+    """
+    Accept exactly ONE PDF and an optional form field 'pages'
+    e.g. pages=1-3     → keeps pages 1-3 (1-based)
+         pages=5       → keeps only page 5
+    If 'pages' missing, return the whole file unchanged
+    """
+    files = request.files.getlist("file")  # NOTE: 'file' singular
+    if len(files) != 1:
+        return jsonify(error="Upload one PDF to split"), 400
+
+    f = files[0]
+    if not allowed_pdf(f):
+        return jsonify(error="Only PDF files allowed"), 400
+
+    # save original to temp
+    src_path = os.path.join(
+        app.config["UPLOAD_FOLDER"],
+        f"{uuid.uuid4()}_{secure_filename(f.filename)}")
+    f.save(src_path)
+
+    # figure out page range
+    pages_req = request.form.get("pages", "").strip()  # e.g. "2-5"
+    reader = PdfReader(src_path)
+    writer = PdfWriter()
+
+    if pages_req:
+        try:
+            if "-" in pages_req:
+                start, end = [int(x) for x in pages_req.split("-", 1)]
+                rng = range(start-1, end)       # zero-based
+            else:
+                page = int(pages_req) - 1
+                rng = range(page, page+1)
+        except ValueError:
+            return jsonify(error="Invalid pages parameter"), 400
+    else:
+        rng = range(len(reader.pages))          # keep all pages
+
+    # add chosen pages
+    for i in rng:
+        if i < 0 or i >= len(reader.pages):
+            return jsonify(error="Page out of range"), 400
+        writer.add_page(reader.pages[i])
+
+    out_path = os.path.join(
+        app.config["UPLOAD_FOLDER"], f"split_{uuid.uuid4()}.pdf")
+    with open(out_path, "wb") as fp:
+        writer.write(fp)
+
+    # cleanup originals after sending
+    @after_this_request
+    def _cleanup(resp):
+        for p in (src_path, out_path):
+            try: os.remove(p)
+            except OSError: pass
+        return resp
+
+    return send_file(
+        out_path,
+        as_attachment=True,
+        download_name="split.pdf",
+        mimetype="application/pdf"
+    )    
 
 # ── run ──────────────────────────────────────────────────────────
 if __name__ == "__main__":
