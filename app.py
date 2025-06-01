@@ -17,6 +17,7 @@ from werkzeug.utils import secure_filename
 from PyPDF2 import PdfMerger, PdfReader, PdfWriter   # ← PdfReader/Writer for split
 from datetime import datetime, timedelta
 import mimetypes, os, uuid
+import subprocess, shlex          # run Ghostscript
 # ─────────────────────────────────────────────────────────────────
 
 app = Flask(__name__)
@@ -182,6 +183,58 @@ def split_pdf():
         download_name="split.pdf",
         mimetype="application/pdf"
     )    
+
+
+# ── COMPRESS (NEW) ────────────────────────
+@app.post("/api/compress")
+def compress_pdf():
+    """
+    Accept ONE PDF + optional 'quality' field:
+       • screen (72 dpi, max shrink)  [default]
+       • ebook  (150 dpi, good balance)
+       • prepress (300 dpi, light shrink)
+    Returns compressed.pdf
+    """
+    file = request.files.get("file")
+    if not file or not allowed_pdf(file):
+        return jsonify(error="Upload one PDF file"), 400
+
+    quality = request.form.get("quality", "screen").lower()
+    if quality not in ("screen", "ebook", "prepress"):
+        return jsonify(error="Invalid quality"), 400
+
+    # store original
+    in_path = os.path.join(app.config["UPLOAD_FOLDER"],
+                           f"{uuid.uuid4()}_{secure_filename(file.filename)}")
+    file.save(in_path)
+
+    out_path = os.path.join(app.config["UPLOAD_FOLDER"],
+                            f"compressed_{uuid.uuid4()}.pdf")
+
+    # Ghostscript command
+    gs_cmd = (
+        f"gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 "
+        f"-dPDFSETTINGS=/{quality} -dNOPAUSE -dQUIET -dBATCH "
+        f"-sOutputFile={shlex.quote(out_path)} {shlex.quote(in_path)}"
+    )
+
+    try:
+        subprocess.run(shlex.split(gs_cmd), check=True)
+    except subprocess.CalledProcessError:
+        return jsonify(error="Compression failed"), 500
+
+    # cleanup originals after send
+    @after_this_request
+    def _cleanup(resp):
+        for p in (in_path, out_path):
+            try: os.remove(p)
+            except OSError: pass
+        return resp
+
+    return send_file(out_path,
+                     as_attachment=True,
+                     download_name="compressed.pdf",
+                     mimetype="application/pdf")
 
 # ── run ──────────────────────────────────────────────────────────
 if __name__ == "__main__":
