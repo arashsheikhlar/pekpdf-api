@@ -19,6 +19,7 @@ from datetime import datetime, timedelta
 import mimetypes, os, uuid
 import subprocess, shlex          # run Ghostscript
 import shutil, platform
+from pdf2docx import Converter
 # ─────────────────────────────────────────────────────────────────
 
 app = Flask(__name__)
@@ -265,6 +266,56 @@ def compress_pdf():
                      as_attachment=True,
                      download_name="compressed.pdf",
                      mimetype="application/pdf")
+
+# ── PDF→Word (NEW) ────────────────────────────────────────
+@app.post("/api/pdf-to-word")
+def pdf_to_word():
+    """
+    Convert ONE PDF to a .docx file.
+    Optional form field 'pages'   e.g. 1-3  or 2
+    """
+    file = request.files.get("file")
+    if not file or not allowed_pdf(file):
+        return jsonify(error="Upload one PDF file"), 400
+
+    pages = request.form.get("pages", "").strip()  # optional
+
+    # save input
+    in_path = os.path.join(app.config["UPLOAD_FOLDER"],
+                           f"{uuid.uuid4()}_{secure_filename(file.filename)}")
+    file.save(in_path)
+
+    out_path = os.path.join(app.config["UPLOAD_FOLDER"],
+                            f"doc_{uuid.uuid4()}.docx")
+
+    # run conversion
+    try:
+        cv = Converter(in_path)
+        if pages:
+            if "-" in pages:
+                start, end = [int(x) for x in pages.split("-", 1)]
+            else:
+                start = end = int(pages)
+            cv.convert(out_path, start=start-1, end=end-1)
+        else:
+            cv.convert(out_path)
+        cv.close()
+    except Exception as e:
+        return jsonify(error=f"Conversion failed: {e}"), 500
+
+    # cleanup after sending
+    @after_this_request
+    def _cleanup(resp):
+        for p in (in_path, out_path):
+            try: os.remove(p)
+            except OSError: pass
+        return resp
+
+    return send_file(out_path,
+                     as_attachment=True,
+                     download_name="converted.docx",
+                     mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+
 
 # ── run ──────────────────────────────────────────────────────────
 if __name__ == "__main__":

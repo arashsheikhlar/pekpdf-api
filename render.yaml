@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: simurghpdf-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    packages:
+      - ghostscript
+      - poppler-utils     # ← for pdf2docx
