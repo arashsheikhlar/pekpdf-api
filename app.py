@@ -34,7 +34,7 @@ CORS(
     resources={r"/api/*": {"origins": [
         "https://perkpdf.com",
         "https://www.perkpdf.com",
-        "simurghpdf-web.vercel.app"
+        "http://simurghpdf-web.vercel.app"
     ]}}
 )
 
