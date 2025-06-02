@@ -346,7 +346,7 @@ def ocr_pdf():
             language=lang,
             deskew=True,
             force_ocr=True,     # run OCR even if file claims to be searchable
-            optimize=0)          # reasonable compression
+            optimize=1)          # reasonable compression
     except Exception as e:
         return jsonify(error=f"OCR failed: {e}"), 500
 
