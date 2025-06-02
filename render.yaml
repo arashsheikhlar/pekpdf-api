@@ -1,14 +1,6 @@
 services:
   - type: web
     name: simurghpdf-api
-    runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python app.py
-    packages:
-      - ghostscript
-      - poppler-utils
-      - tesseract
-      - pytesseract
-      - tesseract-ocr
-      - libtesseract-dev
-      - pngquant
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
