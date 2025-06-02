@@ -20,7 +20,6 @@ import mimetypes, os, uuid
 import subprocess, shlex          # run Ghostscript
 import shutil, platform
 from pdf2docx import Converter
-from ocrmypdf import ocr
 # ─────────────────────────────────────────────────────────────────
 
 app = Flask(__name__)
@@ -29,11 +28,9 @@ origins = []
 if os.getenv("FLASK_ENV") == "development":
     origins.append("http://localhost:5173")
 
-# PRODUCTION CORS: only front‐end domains may access /api/*
 origins.extend([
     "https://perkpdf.com",
     "https://www.perkpdf.com",
-    "https://simurghpdf-web.vercel.app"
 ])
 
 CORS(
@@ -321,46 +318,6 @@ def pdf_to_word():
                      as_attachment=True,
                      download_name="converted.docx",
                      mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-
-
-# ── OCR ─────────────────────────────────────────────
-@app.post("/api/ocr")
-def ocr_pdf():
-    """
-    Make a PDF searchable (runs Tesseract OCR layer).
-    Optional form field 'lang' (ISO code, default 'eng').
-    """
-    file = request.files.get("file")
-    if not file or not allowed_pdf(file):
-        return jsonify(error="Upload one PDF file"), 400
-
-    lang = request.form.get("lang", "eng")   # e.g. eng, deu, spa
-    in_path = os.path.join(app.config["UPLOAD_FOLDER"],
-                           f"{uuid.uuid4()}_{secure_filename(file.filename)}")
-    out_path = os.path.join(app.config["UPLOAD_FOLDER"],
-                            f"ocr_{uuid.uuid4()}.pdf")
-    file.save(in_path)
-
-    try:
-        ocr(in_path, out_path,
-            language=lang,
-            deskew=True,
-            force_ocr=True,     # run OCR even if file claims to be searchable
-            optimize=2)          # reasonable compression
-    except Exception as e:
-        return jsonify(error=f"OCR failed: {e}"), 500
-
-    @after_this_request
-    def _clean(resp):
-        for p in (in_path, out_path):
-            try: os.remove(p)
-            except OSError: pass
-        return resp
-
-    return send_file(out_path,
-                     as_attachment=True,
-                     download_name="searchable.pdf",
-                     mimetype="application/pdf")
 
 
 # ── run ──────────────────────────────────────────────────────────
