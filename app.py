@@ -25,18 +25,22 @@ from ocrmypdf import ocr
 
 app = Flask(__name__)
 
+origins = []
 if os.getenv("FLASK_ENV") == "development":
     origins.append("http://localhost:5173")
 
-# PRODUCTION CORS: only front-end domains may access /api/*
+# PRODUCTION CORS: only front‐end domains may access /api/*
+origins.extend([
+    "https://perkpdf.com",
+    "https://www.perkpdf.com",
+    "https://perkpdf-web.vercel.app"
+])
+
 CORS(
     app,
-    resources={r"/api/*": {"origins": [
-        "https://perkpdf.com",
-        "https://www.perkpdf.com",
-        "https://simurghpdf-web.vercel.app"
-    ]}}
+    resources={r"/api/*": {"origins": origins}}
 )
+
 
 # ── config & housekeeping ───────────────────────────────────────
 app.config["UPLOAD_FOLDER"]      = "temp"
