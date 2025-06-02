@@ -4,8 +4,9 @@ services:
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: python app.py
-    packages:                 # Debian packages Render pre-installs
+    packages:
       - ghostscript
-      - poppler-utils         # already for pdf2docx
-      - tesseract-ocr         # OCR engine
-      - libtesseract-dev      # header files (needed on some images)
+      - poppler-utils
+      - tesseract-ocr
+      - libtesseract-dev
+      - pngquant
