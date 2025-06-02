@@ -3,3 +3,4 @@ PyPDF2
 flask-cors
 ghostscript>=0.7
 pdf2docx>=0.5
+ocrmypdf>=16.0      
