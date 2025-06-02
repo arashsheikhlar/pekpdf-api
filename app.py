@@ -33,7 +33,7 @@ if os.getenv("FLASK_ENV") == "development":
 origins.extend([
     "https://perkpdf.com",
     "https://www.perkpdf.com",
-    "https://perkpdf-web.vercel.app"
+    "https://simurghpdf-web.vercel.app"
 ])
 
 CORS(
