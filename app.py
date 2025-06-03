@@ -24,6 +24,8 @@ from PIL import Image           # for JPG/PNG → PDF
 import fitz                     # PyMuPDF, for PDF → JPG/PNG
 from pdfminer.high_level import extract_text_to_fp
 from pdfminer.layout import LAParams
+import pdfplumber
+import pandas as pd
 # ─────────────────────────────────────────────────────────────────
 
 app = Flask(__name__)
@@ -505,6 +507,117 @@ def pdf_to_text():
 
     # 5️⃣ Return the extracted text
     return (text, 200, {"Content-Type": "text/plain; charset=utf-8"})
+
+# ── Route: PDF → Excel ─────────────────────────────────────────────────────────
+@app.post("/api/pdf-to-excel")
+def pdf_to_excel():
+    """
+    1) Accept exactly one PDF upload.
+    2) Use pdfplumber to extract all tables (one sheet per table).
+    3) If tables are found, write them into an .xlsx (each table gets its own sheet).
+    4) If no tables are found, fallback to extracting raw text into a .csv.
+    5) Return the resulting file, then clean up temp files.
+    """
+    # 1) Validate exactly one PDF file was sent
+    files = request.files.getlist("file")
+    if len(files) != 1:
+        return jsonify(error="Upload exactly one PDF file"), 400
+
+    f = files[0]
+    if not allowed_pdf(f):
+        return jsonify(error="Only PDF files allowed"), 400
+
+    # 2) Save incoming PDF to a temp path
+    in_filename = f"{uuid.uuid4()}_{f.filename}"
+    in_path = os.path.join(app.config["UPLOAD_FOLDER"], in_filename)
+    f.save(in_path)
+
+    # 3) Open with pdfplumber and collect every table
+    try:
+        pdf = pdfplumber.open(in_path)
+    except Exception as e:
+        os.remove(in_path)
+        return jsonify(error=f"Cannot open PDF: {e}"), 400
+
+    tables_found = []
+    for page_number, page in enumerate(pdf.pages, start=1):
+        page_tables = page.extract_tables()  # list of raw tables (each a list-of-lists)
+        for tbl_idx, raw_table in enumerate(page_tables, start=1):
+            tables_found.append((page_number, tbl_idx, raw_table))
+
+    pdf.close()
+
+    # 4) Prepare an output path for either .xlsx or .csv
+    out_xlsx = os.path.join(
+        app.config["UPLOAD_FOLDER"],
+        f"tables_{uuid.uuid4()}.xlsx"
+    )
+
+    if tables_found:
+        # 5a) If we found tables, write each to its own sheet in an .xlsx
+        with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
+            for (pnum, tidx, raw_table) in tables_found:
+                # Convert raw_table (list of rows) → DataFrame
+                if len(raw_table) > 1:
+                    # treat first row as header
+                    df = pd.DataFrame(raw_table[1:], columns=raw_table[0])
+                else:
+                    # single-row table → no header inference
+                    df = pd.DataFrame(raw_table)
+
+                sheet_name = f"page{pnum}_tbl{tidx}"
+                # pandas will auto-create the sheet
+                df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+            # *** DO NOT call writer.save() here ***
+            # Exiting the 'with' block automatically saves the .xlsx.
+
+        download_name = "extracted_tables.xlsx"
+        mimetype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        out_path = out_xlsx
+
+    else:
+        # 5b) If no tables, extract raw text line‐by‐line and write a .csv
+        txt_lines = []
+        try:
+            with pdfplumber.open(in_path) as pdf_obj:
+                for page in pdf_obj.pages:
+                    page_text = page.extract_text() or ""
+                    txt_lines.extend(page_text.split("\n"))
+        except Exception:
+            # Fallback to pdfminer if pdfplumber fails for text
+            from pdfminer.high_level import extract_text
+            txt_str = extract_text(in_path)
+            txt_lines = txt_str.split("\n") if txt_str else []
+
+        out_csv = os.path.join(
+            app.config["UPLOAD_FOLDER"],
+            f"text_{uuid.uuid4()}.csv"
+        )
+        df_txt = pd.DataFrame({"line": txt_lines})
+        df_txt.to_csv(out_csv, index=False, encoding="utf-8")
+
+        download_name = "extracted_text.csv"
+        mimetype = "text/csv"
+        out_path = out_csv
+
+    # 6) Schedule cleanup of both the original PDF and generated output
+    @after_this_request
+    def cleanup(response):
+        try:
+            os.remove(in_path)
+            os.remove(out_path)
+        except OSError:
+            pass
+        return response
+
+    # 7) Return the file to the user
+    return send_file(
+        out_path,
+        as_attachment=True,
+        download_name=download_name,
+        mimetype=mimetype
+    )
 
 
 # ── run ──────────────────────────────────────────────────────────
