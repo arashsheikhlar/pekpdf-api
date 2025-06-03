@@ -20,6 +20,8 @@ import mimetypes, os, uuid
 import subprocess, shlex          # run Ghostscript
 import shutil, platform
 from pdf2docx import Converter
+from PIL import Image           # for JPG/PNG → PDF
+import fitz                     # PyMuPDF, for PDF → JPG/PNG
 # ─────────────────────────────────────────────────────────────────
 
 app = Flask(__name__)
@@ -64,6 +66,14 @@ def allowed_pdf(fileobj):
     mime = fileobj.mimetype == "application/pdf"
     guess= mimetypes.guess_type(fileobj.filename)[0] == "application/pdf"
     return ext and mime and guess
+
+def allowed_image(fileobj):
+    # Accept common image types (jpg, jpeg, png)
+    fn = fileobj.filename.lower()
+    return (
+        (fn.endswith(".jpg") or fn.endswith(".jpeg") or fn.endswith(".png"))
+        and fileobj.mimetype.startswith("image/")
+    )
 
 # -------------------------
 def gs_executable():
@@ -318,6 +328,119 @@ def pdf_to_word():
                      as_attachment=True,
                      download_name="converted.docx",
                      mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+
+# ── Route: Images → PDF ─────────────────────────────────────────────────────────
+@app.post("/api/images-to-pdf")
+def images_to_pdf():
+    """
+    Accept one or more JPG/PNG files and bundle them into a single PDF.
+    Returns a PDF that stacks each image as one page.
+    """
+    files = request.files.getlist("files")
+    if not files:
+        return jsonify(error="Upload at least one JPG or PNG"), 400
+
+    pil_images = []
+    for f in files:
+        if not allowed_image(f):
+            return jsonify(error=f"Invalid image: {f.filename}"), 400
+        try:
+            img = Image.open(f.stream).convert("RGB")
+            pil_images.append(img)
+        except Exception as e:
+            return jsonify(error=f"Could not open {f.filename}: {e}"), 400
+
+    # Build a temporary output PDF path
+    out_filename = f"images2pdf_{uuid.uuid4()}.pdf"
+    out_path = os.path.join(app.config["UPLOAD_FOLDER"], out_filename)
+
+    try:
+        # If there’s only one image, `.save` still works. For multiple, pass append_images.
+        pil_images[0].save(
+            out_path,
+            format="PDF",
+            save_all=True,
+            append_images=pil_images[1:] if len(pil_images) > 1 else None
+        )
+    except Exception as e:
+        return jsonify(error=f"Failed to convert to PDF: {e}"), 500
+
+    @after_this_request
+    def cleanup(response):
+        try:
+            os.remove(out_path)
+        except OSError:
+            pass
+        return response
+
+    return send_file(
+        out_path,
+        as_attachment=True,
+        download_name="converted_images.pdf",
+        mimetype="application/pdf"
+    )
+
+
+# ── Route: PDF → Images ─────────────────────────────────────────────────────────
+@app.post("/api/pdf-to-images")
+def pdf_to_images():
+    """
+    Accept exactly one PDF and return a ZIP of PNGs (one per page).
+    If you’d prefer a single image instead of a ZIP, you could adapt this code.
+    """
+    f = request.files.get("file")
+    if not f or not allowed_pdf(f):
+        return jsonify(error="Upload one PDF file"), 400
+
+    # Save the incoming PDF temporarily
+    in_filename = f"{uuid.uuid4()}_{f.filename}"
+    in_path = os.path.join(app.config["UPLOAD_FOLDER"], in_filename)
+    f.save(in_path)
+
+    # Open PDF with PyMuPDF
+    try:
+        pdf_doc = fitz.open(in_path)
+    except Exception as e:
+        return jsonify(error=f"Could not open PDF: {e}"), 400
+
+    # Create a temporary ZIP archive to store each page as PNG
+    import zipfile, tempfile
+    tmpzip = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+    zipf = zipfile.ZipFile(tmpzip.name, mode="w")
+
+    try:
+        for page_number in range(pdf_doc.page_count):
+            page = pdf_doc.load_page(page_number)
+            pix = page.get_pixmap()  # default is 72 dpi; you can pass `dpi=150` etc.
+            img_data = pix.tobytes("png")  # get raw PNG bytes
+
+            # Write each page’s PNG into the ZIP as page_1.png, page_2.png, etc.
+            zipf.writestr(f"page_{page_number+1}.png", img_data)
+
+    except Exception as e:
+        zipf.close()
+        pdf_doc.close()
+        os.remove(in_path)
+        return jsonify(error=f"Failed rendering pages: {e}"), 500
+
+    zipf.close()
+    pdf_doc.close()
+
+    @after_this_request
+    def cleanup(response):
+        try:
+            os.remove(in_path)
+            os.remove(tmpzip.name)
+        except OSError:
+            pass
+        return response
+
+    return send_file(
+        tmpzip.name,
+        as_attachment=True,
+        download_name="pdf_pages.zip",
+        mimetype="application/zip"
+    )
 
 
 # ── run ──────────────────────────────────────────────────────────
