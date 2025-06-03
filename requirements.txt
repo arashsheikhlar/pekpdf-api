@@ -2,4 +2,6 @@ Flask
 PyPDF2
 flask-cors
 ghostscript>=0.7
-pdf2docx>=0.5   
+pdf2docx>=0.5
+Pillow>=9.0.0
+PyMuPDF>=1.26.0
