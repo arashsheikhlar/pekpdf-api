@@ -619,6 +619,148 @@ def pdf_to_excel():
         mimetype=mimetype
     )
 
+# ── Route: Delete pages ─────────────────────────────────────────────────────────
+@app.post("/api/delete-pages")
+def delete_pages():
+    """
+    Delete Pages endpoint:
+      • Expects exactly one uploaded PDF under field "file"
+      • Form field "delete" = comma-sep list of 1-based page numbers to drop (e.g. "2,5,7")
+    Returns a new PDF with those pages removed.
+    """
+    files = request.files.getlist("file")
+    if len(files) != 1:
+        return jsonify(error="Upload exactly one PDF file"), 400
+
+    f = files[0]
+    if not allowed_pdf(f):
+        return jsonify(error="Only PDF files are allowed"), 400
+
+    delete_str = request.form.get("delete", "").strip()
+    if not delete_str:
+        return jsonify(error="Provide pages to delete, e.g. delete=2,5"), 400
+
+    # Save incoming PDF
+    in_name = f"{uuid.uuid4()}_{secure_filename(f.filename)}"
+    in_path = os.path.join(app.config["UPLOAD_FOLDER"], in_name)
+    f.save(in_path)
+
+    try:
+        reader = PdfReader(in_path)
+    except Exception as e:
+        os.remove(in_path)
+        return jsonify(error=f"Cannot read PDF: {e}"), 400
+
+    num_pages = len(reader.pages)
+    # Parse delete_str → zero-based indices
+    try:
+        delete_idxs = sorted({int(x) - 1 for x in delete_str.split(",")})
+    except ValueError:
+        os.remove(in_path)
+        return jsonify(error="Invalid delete format. Use e.g. 2,5,7"), 400
+
+    # Validate range
+    if any(idx < 0 or idx >= num_pages for idx in delete_idxs):
+        os.remove(in_path)
+        return jsonify(error="Delete page out of range"), 400
+
+    # Build new page order by skipping those indices
+    keep_indices = [i for i in range(num_pages) if i not in set(delete_idxs)]
+    writer = PdfWriter()
+    for i in keep_indices:
+        writer.add_page(reader.pages[i])
+
+    out_name = f"deleted_{uuid.uuid4()}.pdf"
+    out_path = os.path.join(app.config["UPLOAD_FOLDER"], out_name)
+    with open(out_path, "wb") as out_f:
+        writer.write(out_f)
+
+    @after_this_request
+    def cleanup(response):
+        try:
+            os.remove(in_path)
+            os.remove(out_path)
+        except OSError:
+            pass
+        return response
+
+    return send_file(
+        out_path,
+        as_attachment=True,
+        download_name="deleted.pdf",
+        mimetype="application/pdf"
+    )
+
+# ── Route: Reorder pages ─────────────────────────────────────────────────────────
+@app.post("/api/reorder-pages")
+def reorder_pages():
+    """
+    Reorder Pages endpoint:
+      • Expects exactly one uploaded PDF under field "file"
+      • Form field "order" = comma-sep list of 1-based pages in the new order,
+        e.g. order=3,1,4,2 for a 4-page PDF.
+    Returns a new PDF with pages rearranged accordingly.
+    """
+    files = request.files.getlist("file")
+    if len(files) != 1:
+        return jsonify(error="Upload exactly one PDF file"), 400
+
+    f = files[0]
+    if not allowed_pdf(f):
+        return jsonify(error="Only PDF files are allowed"), 400
+
+    order_str = request.form.get("order", "").strip()
+    if not order_str:
+        return jsonify(error="Provide a reorder pattern, e.g. order=3,1,2"), 400
+
+    # Save incoming PDF
+    in_name = f"{uuid.uuid4()}_{secure_filename(f.filename)}"
+    in_path = os.path.join(app.config["UPLOAD_FOLDER"], in_name)
+    f.save(in_path)
+
+    try:
+        reader = PdfReader(in_path)
+    except Exception as e:
+        os.remove(in_path)
+        return jsonify(error=f"Cannot read PDF: {e}"), 400
+
+    num_pages = len(reader.pages)
+    # Parse order_str → zero-based list
+    try:
+        new_order = [int(x) - 1 for x in order_str.split(",")]
+    except ValueError:
+        os.remove(in_path)
+        return jsonify(error="Invalid order format. Use e.g. 3,1,2"), 400
+
+    # Must cover exactly each page once
+    if sorted(new_order) != list(range(num_pages)):
+        os.remove(in_path)
+        return jsonify(error="Reorder must list each page exactly once"), 400
+
+    writer = PdfWriter()
+    for idx in new_order:
+        writer.add_page(reader.pages[idx])
+
+    out_name = f"reordered_{uuid.uuid4()}.pdf"
+    out_path = os.path.join(app.config["UPLOAD_FOLDER"], out_name)
+    with open(out_path, "wb") as out_f:
+        writer.write(out_f)
+
+    @after_this_request
+    def cleanup(response):
+        try:
+            os.remove(in_path)
+            os.remove(out_path)
+        except OSError:
+            pass
+        return response
+
+    return send_file(
+        out_path,
+        as_attachment=True,
+        download_name="reordered.pdf",
+        mimetype="application/pdf"
+    )
 
 # ── run ──────────────────────────────────────────────────────────
 if __name__ == "__main__":
