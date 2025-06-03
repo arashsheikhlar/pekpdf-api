@@ -25,6 +25,8 @@ import fitz                     # PyMuPDF, for PDF → JPG/PNG
 # ─────────────────────────────────────────────────────────────────
 
 app = Flask(__name__)
+app.config["UPLOAD_FOLDER"] = "temp"
+os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
 
 origins = []
 if os.getenv("FLASK_ENV") == "development":
@@ -68,12 +70,15 @@ def allowed_pdf(fileobj):
     return ext and mime and guess
 
 def allowed_image(fileobj):
-    # Accept common image types (jpg, jpeg, png)
-    fn = fileobj.filename.lower()
-    return (
-        (fn.endswith(".jpg") or fn.endswith(".jpeg") or fn.endswith(".png"))
-        and fileobj.mimetype.startswith("image/")
-    )
+    """
+    Accept only JPG/JPEG/PNG uploads:
+      • filename must end in .jpg/.jpeg/.png
+      • mimetype must start with "image/"
+    """
+    fname = fileobj.filename.lower()
+    ext_ok = fname.endswith(".jpg") or fname.endswith(".jpeg") or fname.endswith(".png")
+    mime_ok = fileobj.mimetype.startswith("image/")
+    return ext_ok and mime_ok
 
 # -------------------------
 def gs_executable():
@@ -349,19 +354,26 @@ def images_to_pdf():
             pil_images.append(img)
         except Exception as e:
             return jsonify(error=f"Could not open {f.filename}: {e}"), 400
-
+    
+    if not pil_images:
+        return jsonify(error="No valid images found"), 400
+    
     # Build a temporary output PDF path
     out_filename = f"images2pdf_{uuid.uuid4()}.pdf"
     out_path = os.path.join(app.config["UPLOAD_FOLDER"], out_filename)
 
     try:
-        # If there’s only one image, `.save` still works. For multiple, pass append_images.
-        pil_images[0].save(
-            out_path,
-            format="PDF",
-            save_all=True,
-            append_images=pil_images[1:] if len(pil_images) > 1 else None
-        )
+        if len(pil_images) == 1:
+            # Only one image → save it normally
+            pil_images[0].save(out_path, format="PDF")
+        else:
+            # Multiple images → use save_all with a nonempty list
+            pil_images[0].save(
+                out_path,
+                format="PDF",
+                save_all=True,
+                append_images=pil_images[1:]
+            )
     except Exception as e:
         return jsonify(error=f"Failed to convert to PDF: {e}"), 500
 
