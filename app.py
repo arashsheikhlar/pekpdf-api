@@ -16,12 +16,14 @@ from flask_cors import CORS                 # allow front-end origin
 from werkzeug.utils import secure_filename
 from PyPDF2 import PdfMerger, PdfReader, PdfWriter   # ← PdfReader/Writer for split
 from datetime import datetime, timedelta
-import mimetypes, os, uuid
+import mimetypes, os, uuid, io
 import subprocess, shlex          # run Ghostscript
 import shutil, platform
 from pdf2docx import Converter
 from PIL import Image           # for JPG/PNG → PDF
 import fitz                     # PyMuPDF, for PDF → JPG/PNG
+from pdfminer.high_level import extract_text_to_fp
+from pdfminer.layout import LAParams
 # ─────────────────────────────────────────────────────────────────
 
 app = Flask(__name__)
@@ -453,6 +455,56 @@ def pdf_to_images():
         download_name="pdf_pages.zip",
         mimetype="application/zip"
     )
+
+# ── Route: PDF → Text ─────────────────────────────────────────────────────────
+@app.post("/api/pdf-to-text")
+def pdf_to_text():
+    """
+    Accept exactly one PDF file, extract all textual content, and return
+    it as plain UTF-8 text. Uses pdfminer.six under the hood (pure Python).
+    """
+    # 1️⃣ Confirm exactly one file was uploaded
+    files = request.files.getlist("file")
+    if len(files) != 1:
+        return jsonify(error="Upload exactly one PDF file"), 400
+
+    f = files[0]
+    if not allowed_pdf(f):
+        return jsonify(error="Only PDF files allowed"), 400
+
+    # 2️⃣ Save the uploaded PDF to a temp path
+    temp_pdf_name = f"{uuid.uuid4()}_{f.filename}"
+    in_path = os.path.join(app.config["UPLOAD_FOLDER"], temp_pdf_name)
+    f.save(in_path)
+
+    # 3️⃣ Extract text using pdfminer.six
+    output_string = io.StringIO()
+    try:
+        # LAParams() is layout analysis; you can tweak it if needed
+        with open(in_path, "rb") as pdf_file_obj:
+            extract_text_to_fp(
+                pdf_file_obj,
+                output_string,
+                laparams=LAParams(),
+                output_type="text",
+                codec="utf-8"
+            )
+        text = output_string.getvalue()
+    except Exception as e:
+        os.remove(in_path)
+        return jsonify(error=f"Text extraction failed: {e}"), 500
+
+    # 4️⃣ Schedule cleanup of the temporary PDF
+    @after_this_request
+    def cleanup(resp):
+        try:
+            os.remove(in_path)
+        except OSError:
+            pass
+        return resp
+
+    # 5️⃣ Return the extracted text
+    return (text, 200, {"Content-Type": "text/plain; charset=utf-8"})
 
 
 # ── run ──────────────────────────────────────────────────────────
