@@ -1,0 +1,32 @@
+Collecting gensim
+  Downloading gensim-4.3.3.tar.gz (23.3 MB)
+     ---------------------------------------- 23.3/23.3 MB 3.1 MB/s eta 0:00:00
+  Installing build dependencies: started
+  Installing build dependencies: finished with status 'done'
+  Getting requirements to build wheel: started
+  Getting requirements to build wheel: finished with status 'done'
+  Preparing metadata (pyproject.toml): started
+  Preparing metadata (pyproject.toml): finished with status 'done'
+Collecting numpy<2.0,>=1.18.5 (from gensim)
+  Downloading numpy-1.26.4.tar.gz (15.8 MB)
+     ---------------------------------------- 15.8/15.8 MB 3.4 MB/s eta 0:00:00
+  Installing build dependencies: started
+  Installing build dependencies: finished with status 'done'
+  Getting requirements to build wheel: started
+  Getting requirements to build wheel: finished with status 'done'
+  Installing backend dependencies: started
+  Installing backend dependencies: finished with status 'done'
+  Preparing metadata (pyproject.toml): started
+  Preparing metadata (pyproject.toml): still running...
+  Preparing metadata (pyproject.toml): finished with status 'done'
+Collecting scipy<1.14.0,>=1.7.0 (from gensim)
+  Downloading scipy-1.13.1.tar.gz (57.2 MB)
+     ---------------------------------------- 57.2/57.2 MB 3.2 MB/s eta 0:00:00
+  Installing build dependencies: started
+  Installing build dependencies: finished with status 'done'
+  Getting requirements to build wheel: started
+  Getting requirements to build wheel: finished with status 'done'
+  Installing backend dependencies: started
+  Installing backend dependencies: finished with status 'done'
+  Preparing metadata (pyproject.toml): started
+  Preparing metadata (pyproject.toml): finished with status 'error'

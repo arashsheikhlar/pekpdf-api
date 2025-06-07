@@ -26,7 +26,14 @@ from pdfminer.high_level import extract_text_to_fp
 from pdfminer.layout import LAParams
 import pdfplumber
 import pandas as pd
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from dotenv import load_dotenv
 # ─────────────────────────────────────────────────────────────────
+
+# Load environment variables from .env file
+load_dotenv()
 
 app = Flask(__name__)
 app.config["UPLOAD_FOLDER"] = "temp"
@@ -402,7 +409,7 @@ def images_to_pdf():
 def pdf_to_images():
     """
     Accept exactly one PDF and return a ZIP of PNGs (one per page).
-    If you’d prefer a single image instead of a ZIP, you could adapt this code.
+    If you'd prefer a single image instead of a ZIP, you could adapt this code.
     """
     f = request.files.get("file")
     if not f or not allowed_pdf(f):
@@ -430,7 +437,7 @@ def pdf_to_images():
             pix = page.get_pixmap()  # default is 72 dpi; you can pass `dpi=150` etc.
             img_data = pix.tobytes("png")  # get raw PNG bytes
 
-            # Write each page’s PNG into the ZIP as page_1.png, page_2.png, etc.
+            # Write each page's PNG into the ZIP as page_1.png, page_2.png, etc.
             zipf.writestr(f"page_{page_number+1}.png", img_data)
 
     except Exception as e:
@@ -761,6 +768,52 @@ def reorder_pages():
         download_name="reordered.pdf",
         mimetype="application/pdf"
     )
+
+@app.route('/api/contact', methods=['POST'])
+def contact():
+    try:
+        data = request.json
+        name = data.get('name')
+        email = data.get('email')
+        subject = data.get('subject')
+        message = data.get('message')
+        to_email = data.get('to', 'perkpdf@gmail.com')  # Updated default email
+
+        # Create email message
+        msg = MIMEMultipart()
+        msg['From'] = 'perkpdf@gmail.com'  # Updated sender email
+        msg['To'] = to_email
+        msg['Subject'] = f'Contact Form: {subject}'
+
+        # Create email body
+        body = f"""
+        New contact form submission from Perk PDF website:
+
+        Name: {name}
+        Email: {email}
+        Subject: {subject}
+
+        Message:
+        {message}
+        """
+
+        msg.attach(MIMEText(body, 'plain'))
+
+        # Send email using SMTP
+        smtp_server = 'smtp.gmail.com'
+        smtp_port = 587
+        smtp_username = 'perkpdf@gmail.com'  # Updated username
+        smtp_password = os.getenv('GMAIL_APP_PASSWORD')  # We'll use this environment variable
+
+        with smtplib.SMTP(smtp_server, smtp_port) as server:
+            server.starttls()
+            server.login(smtp_username, smtp_password)
+            server.send_message(msg)
+
+        return jsonify({'message': 'Email sent successfully'}), 200
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 # ── run ──────────────────────────────────────────────────────────
 if __name__ == "__main__":
