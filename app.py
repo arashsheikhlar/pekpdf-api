@@ -56,7 +56,7 @@ CORS(
 
 # ── config & housekeeping ───────────────────────────────────────
 app.config["UPLOAD_FOLDER"]      = "temp"
-app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024    # 25 MB
+app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024    # 100 MB
 os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
 
 def purge_old_files(hours: int = 12):
@@ -814,6 +814,10 @@ def contact():
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+@app.errorhandler(413)
+def file_too_large(e):
+    return jsonify(error="File too large (max 100 MB)"), 413
 
 # ── run ──────────────────────────────────────────────────────────
 if __name__ == "__main__":
