@@ -126,6 +126,208 @@ def health():
     return jsonify(status="ok"), 200
 
 
+# ── CONVERT (Unified) ─────────────────────────────────────────────────────
+@app.get("/api/convert/formats")
+def convert_formats():
+    """
+    Returns a list of supported conversion formats handled by POST /api/convert.
+    We intentionally expose only formats backed by implemented routes.
+    """
+    return jsonify({
+        "formats": [
+            "docx",     # PDF → Word
+            "xlsx",     # PDF → Excel (tables) or text CSV fallback logic reused under the hood
+            "txt",      # PDF → plain text
+            "png-zip",  # PDF → images (PNG) zipped
+        ]
+    }), 200
+
+
+@app.post("/api/convert")
+def convert_unified():
+    """
+    Unified conversion endpoint.
+    Expects multipart/form-data with fields:
+      • file   → the source PDF
+      • format → one of: docx | xlsx | txt | png-zip
+    """
+    f = request.files.get("file")
+    if not f or not allowed_pdf(f):
+        return jsonify(error="Upload one PDF file"), 400
+
+    target_format = (request.form.get("format") or "").lower().strip()
+    if target_format not in ("docx", "xlsx", "txt", "png-zip"):
+        return jsonify(error="Unsupported format"), 400
+
+    # Save incoming PDF
+    base_name = secure_filename(f.filename)
+    src_path = os.path.join(app.config["UPLOAD_FOLDER"], f"{uuid.uuid4()}_{base_name}")
+    f.save(src_path)
+
+    try:
+        if target_format == "docx":
+            # Reuse logic from pdf_to_word
+            out_path = os.path.join(app.config["UPLOAD_FOLDER"], f"converted_{uuid.uuid4()}.docx")
+            try:
+                cv = Converter(src_path)
+                cv.convert(out_path)
+                cv.close()
+            except Exception as e:
+                return jsonify(error=f"Conversion failed: {e}"), 500
+
+            @after_this_request
+            def _cleanup_docx(resp):
+                for p in (src_path, out_path):
+                    try: os.remove(p)
+                    except OSError: pass
+                return resp
+
+            return send_file(
+                out_path,
+                as_attachment=True,
+                download_name=os.path.splitext(base_name)[0] + ".docx",
+                mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+
+        if target_format == "xlsx":
+            # Reuse logic pattern from pdf_to_excel
+            import tempfile
+            out_xlsx = os.path.join(app.config["UPLOAD_FOLDER"], f"tables_{uuid.uuid4()}.xlsx")
+
+            # Try table extraction; fallback to text CSV in a second sheet if no tables
+            tables_found = []
+            try:
+                with pdfplumber.open(src_path) as pdf:
+                    for page_number, page in enumerate(pdf.pages, start=1):
+                        page_tables = page.extract_tables()
+                        for tbl_idx, raw_table in enumerate(page_tables, start=1):
+                            tables_found.append((page_number, tbl_idx, raw_table))
+            except Exception:
+                tables_found = []
+
+            if tables_found:
+                with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
+                    for (pnum, tidx, raw_table) in tables_found:
+                        if len(raw_table) > 1:
+                            df = pd.DataFrame(raw_table[1:], columns=raw_table[0])
+                        else:
+                            df = pd.DataFrame(raw_table)
+                        sheet_name = f"page{pnum}_tbl{tidx}"
+                        df.to_excel(writer, sheet_name=sheet_name, index=False)
+            else:
+                # Fallback: extract text lines and put them into a simple sheet
+                try:
+                    with pdfplumber.open(src_path) as pdf_obj:
+                        lines = []
+                        for page in pdf_obj.pages:
+                            page_text = page.extract_text() or ""
+                            lines.extend(page_text.split("\n"))
+                except Exception:
+                    from pdfminer.high_level import extract_text
+                    txt_str = extract_text(src_path)
+                    lines = txt_str.split("\n") if txt_str else []
+
+                with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
+                    df_txt = pd.DataFrame({"line": lines})
+                    df_txt.to_excel(writer, sheet_name="text", index=False)
+
+            @after_this_request
+            def _cleanup_xlsx(resp):
+                for p in (src_path, out_xlsx):
+                    try: os.remove(p)
+                    except OSError: pass
+                return resp
+
+            return send_file(
+                out_xlsx,
+                as_attachment=True,
+                download_name=os.path.splitext(base_name)[0] + ".xlsx",
+                mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+        if target_format == "txt":
+            # Reuse logic from pdf_to_text
+            output_string = io.StringIO()
+            try:
+                with open(src_path, "rb") as pdf_file_obj:
+                    extract_text_to_fp(
+                        pdf_file_obj,
+                        output_string,
+                        laparams=LAParams(),
+                        output_type="text",
+                        codec="utf-8",
+                    )
+                text = output_string.getvalue()
+            except Exception as e:
+                return jsonify(error=f"Text extraction failed: {e}"), 500
+
+            @after_this_request
+            def _cleanup_txt(resp):
+                try: os.remove(src_path)
+                except OSError: pass
+                return resp
+
+            # Return as a text file attachment
+            from flask import Response
+            download_name = os.path.splitext(base_name)[0] + ".txt"
+            resp = Response(text, mimetype="text/plain; charset=utf-8")
+            resp.headers["Content-Disposition"] = f"attachment; filename=\"{download_name}\""
+            return resp
+
+        if target_format == "png-zip":
+            # Reuse logic from pdf_to_images but keep it here to control filename
+            import zipfile, tempfile
+            tmpzip = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+            zipf = zipfile.ZipFile(tmpzip.name, mode="w")
+            try:
+                pdf_doc = fitz.open(src_path)
+            except Exception as e:
+                return jsonify(error=f"Could not open PDF: {e}"), 400
+
+            try:
+                for page_number in range(pdf_doc.page_count):
+                    page = pdf_doc.load_page(page_number)
+                    pix = page.get_pixmap()
+                    img_data = pix.tobytes("png")
+                    zipf.writestr(f"page_{page_number+1}.png", img_data)
+            except Exception as e:
+                zipf.close()
+                pdf_doc.close()
+                try: os.remove(src_path)
+                except OSError: pass
+                try: os.remove(tmpzip.name)
+                except OSError: pass
+                return jsonify(error=f"Failed rendering pages: {e}"), 500
+
+            zipf.close()
+            pdf_doc.close()
+
+            @after_this_request
+            def _cleanup_zip(resp):
+                for p in (src_path, tmpzip.name):
+                    try: os.remove(p)
+                    except OSError: pass
+                return resp
+
+            return send_file(
+                tmpzip.name,
+                as_attachment=True,
+                download_name=os.path.splitext(base_name)[0] + "_images.zip",
+                mimetype="application/zip",
+            )
+
+        # Should not reach here
+        return jsonify(error="Unhandled format"), 400
+
+    finally:
+        # Safety: if any early return forgot cleanup of src_path
+        try:
+            if os.path.exists(src_path):
+                os.remove(src_path)
+        except OSError:
+            pass
+
+
 @app.post("/api/merge")
 def merge_pdfs():
     """Merge uploaded PDFs and return the merged file."""
@@ -584,7 +786,7 @@ def pdf_to_excel():
         out_path = out_xlsx
 
     else:
-        # 5b) If no tables, extract raw text line‐by‐line and write a .csv
+        # 5b) If no tables, extract raw text line‐by‐line and write an .xlsx (single sheet)
         txt_lines = []
         try:
             with pdfplumber.open(in_path) as pdf_obj:
@@ -597,16 +799,14 @@ def pdf_to_excel():
             txt_str = extract_text(in_path)
             txt_lines = txt_str.split("\n") if txt_str else []
 
-        out_csv = os.path.join(
-            app.config["UPLOAD_FOLDER"],
-            f"text_{uuid.uuid4()}.csv"
-        )
-        df_txt = pd.DataFrame({"line": txt_lines})
-        df_txt.to_csv(out_csv, index=False, encoding="utf-8")
+        # Write text lines into an Excel file to ensure .xlsx output consistently
+        with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
+            df_txt = pd.DataFrame({"line": txt_lines})
+            df_txt.to_excel(writer, sheet_name="text", index=False)
 
-        download_name = "extracted_text.csv"
-        mimetype = "text/csv"
-        out_path = out_csv
+        download_name = "extracted_text.xlsx"
+        mimetype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        out_path = out_xlsx
 
     # 6) Schedule cleanup of both the original PDF and generated output
     @after_this_request
