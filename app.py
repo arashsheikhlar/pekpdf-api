@@ -25,7 +25,16 @@ import fitz                     # PyMuPDF, for PDF → JPG/PNG
 from pdfminer.high_level import extract_text_to_fp
 from pdfminer.layout import LAParams
 import pdfplumber
-import pandas as pd
+
+# Try to import pandas, but make it optional
+try:
+    import pandas as pd
+    PANDAS_AVAILABLE = True
+except ImportError as e:
+    print(f"Warning: pandas not available: {e}")
+    PANDAS_AVAILABLE = False
+    pd = None
+
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart

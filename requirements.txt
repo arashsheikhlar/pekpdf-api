@@ -6,9 +6,10 @@ Pillow==10.0.1
 PyMuPDF==1.23.8
 pdfminer.six==20221105
 pdfplumber==0.10.2
-pandas==2.1.1
-openpyxl==3.1.2
 python-dotenv==1.0.0
 requests==2.31.0
 Werkzeug==2.3.7
 openai==0.28.1
+# Lightweight alternatives for heavy packages
+# openpyxl==3.1.2  # Commented out - can cause issues
+# pandas and numpy commented out - can cause compatibility issues
