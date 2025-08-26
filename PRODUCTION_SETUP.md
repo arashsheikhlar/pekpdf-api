@@ -8,10 +8,10 @@ Ollama is not running on Render servers. Ollama requires local installation and 
 
 ## Solutions
 
-### Option 1: Use OpenAI (Recommended for Production)
+### Option 1: Use Anthropic Claude (Recommended for Production - Free Tier Available)
 
-#### 1. Get OpenAI API Key
-- Visit [OpenAI Platform](https://platform.openai.com/api-keys)
+#### 1. Get Anthropic API Key
+- Visit [Anthropic Console](https://console.anthropic.com/)
 - Create a new API key
 - Copy the key
 
@@ -21,26 +21,27 @@ In your Render dashboard:
 2. Click "Environment"
 3. Add these variables:
    ```
-   AI_SERVICE=openai
-   OPENAI_API_KEY=your_openai_api_key_here
-   OPENAI_MODEL=gpt-3.5-turbo
+   AI_SERVICE=anthropic
+   ANTHROPIC_API_KEY=your_anthropic_api_key_here
+   ANTHROPIC_MODEL=claude-3-haiku-20240307
    ```
 
 #### 3. Deploy
 - Push your changes to GitHub
 - Render will automatically rebuild and deploy
 
-### Option 2: Use Anthropic Claude (Alternative)
+### Option 2: Use OpenAI (Alternative - Paid)
 
-#### 1. Get Anthropic API Key
-- Visit [Anthropic Console](https://console.anthropic.com/)
+#### 1. Get OpenAI API Key
+- Visit [OpenAI Platform](https://platform.openai.com/api-keys)
 - Create a new API key
+- Copy the key
 
-#### 2. Configure Environment Variables
+#### 2. Configure Environment Variables on Render
    ```
-   AI_SERVICE=anthropic
-   ANTHROPIC_API_KEY=your_anthropic_api_key_here
-   ANTHROPIC_MODEL=claude-3-haiku-20240307
+   AI_SERVICE=openai
+   OPENAI_API_KEY=your_openai_api_key_here
+   OPENAI_MODEL=gpt-3.5-turbo
    ```
 
 ### Option 3: Hybrid Approach (Development + Production)
@@ -54,29 +55,30 @@ OLLAMA_MODEL=llama3.1:8b
 
 #### Production (Render Environment Variables)
 ```env
-AI_SERVICE=openai
-OPENAI_API_KEY=your_key_here
-OPENAI_MODEL=gpt-3.5-turbo
+AI_SERVICE=anthropic
+ANTHROPIC_API_KEY=your_key_here
+ANTHROPIC_MODEL=claude-3-haiku-20240307
 ```
 
 ## Cost Considerations
+
+### Anthropic Claude Haiku (Recommended)
+- **Input**: $0.00025 per 1K tokens  
+- **Output**: $0.00125 per 1K tokens
+- **Typical PDF analysis**: $0.005-0.02 per document
+- **Free tier**: Available with generous limits
 
 ### OpenAI GPT-3.5-turbo
 - **Input**: $0.0015 per 1K tokens
 - **Output**: $0.002 per 1K tokens
 - **Typical PDF analysis**: $0.01-0.05 per document
 
-### Anthropic Claude Haiku
-- **Input**: $0.00025 per 1K tokens  
-- **Output**: $0.00125 per 1K tokens
-- **Typical PDF analysis**: $0.005-0.02 per document
-
 ## Testing
 
-### 1. Test Locally with OpenAI
+### 1. Test Locally with Anthropic
 ```bash
-export AI_SERVICE=openai
-export OPENAI_API_KEY=your_key_here
+export AI_SERVICE=anthropic
+export ANTHROPIC_API_KEY=your_key_here
 python app.py
 ```
 
@@ -89,17 +91,17 @@ python app.py
 
 ### Common Issues:
 
-#### 1. "OpenAI API key not configured"
+#### 1. "Anthropic API key not configured"
 - Check environment variables on Render
-- Ensure `AI_SERVICE=openai` is set
+- Ensure `AI_SERVICE=anthropic` is set
 
 #### 2. "Rate limit exceeded"
-- OpenAI has rate limits on free tier
-- Consider upgrading or using Anthropic
+- Anthropic has generous free tier limits
+- Check your usage in Anthropic Console
 
 #### 3. "Model not found"
-- Check `OPENAI_MODEL` environment variable
-- Use valid model names like `gpt-3.5-turbo`
+- Check `ANTHROPIC_MODEL` environment variable
+- Use valid model names like `claude-3-haiku-20240307`
 
 ## Security Notes
 
@@ -110,7 +112,7 @@ python app.py
 
 ## Next Steps
 
-1. Choose your AI service (OpenAI recommended)
+1. **Choose Anthropic** (recommended - free tier available)
 2. Get API key and configure environment variables
 3. Deploy to Render
 4. Test AI tools on production

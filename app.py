@@ -46,16 +46,20 @@ import json
 load_dotenv()
 
 # AI Service configuration
-AI_SERVICE = os.getenv("AI_SERVICE", "ollama")  # "ollama" or "openai"
+AI_SERVICE = os.getenv("AI_SERVICE", "ollama")  # "ollama", "openai", or "anthropic"
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-haiku-20240307")
 
 def call_ai_service(prompt, system_prompt=""):
-    """Call AI service (Ollama or OpenAI) based on configuration"""
+    """Call AI service (Ollama, OpenAI, or Anthropic) based on configuration"""
     if AI_SERVICE == "openai":
         return call_openai(prompt, system_prompt)
+    elif AI_SERVICE == "anthropic":
+        return call_anthropic(prompt, system_prompt)
     else:
         return call_ollama(prompt, system_prompt)
 
@@ -84,6 +88,32 @@ def call_openai(prompt, system_prompt=""):
     except Exception as e:
         print(f"DEBUG: Exception calling OpenAI: {e}")
         return f"Error calling OpenAI: {str(e)}"
+
+def call_anthropic(prompt, system_prompt=""):
+    """Call Anthropic API with the given prompt"""
+    if not ANTHROPIC_API_KEY:
+        return "Error: Anthropic API key not configured. Set ANTHROPIC_API_KEY environment variable."
+    
+    try:
+        import anthropic
+        anthropic.api_key = ANTHROPIC_API_KEY
+        
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+        
+        response = anthropic.Anthropic.start_completion(
+            model=ANTHROPIC_MODEL,
+            prompt=anthropic.HUMAN_PROMPT + prompt + anthropic.AI_PROMPT,
+            max_tokens=1000,
+            temperature=0.7
+        )
+        
+        return response.completion
+    except Exception as e:
+        print(f"DEBUG: Exception calling Anthropic: {e}")
+        return f"Error calling Anthropic: {str(e)}"
 
 def call_ollama(prompt, system_prompt=""):
     """Call Ollama API with the given prompt"""
