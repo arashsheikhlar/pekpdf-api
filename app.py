@@ -97,7 +97,10 @@ def call_anthropic(prompt, system_prompt=""):
     try:
         import anthropic
         
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        # Create client with minimal configuration to avoid compatibility issues
+        client = anthropic.Anthropic(
+            api_key=ANTHROPIC_API_KEY,
+        )
         
         # Prepare messages
         messages = []
@@ -114,9 +117,21 @@ def call_anthropic(prompt, system_prompt=""):
         )
         
         return response.content[0].text
+        
+    except ImportError as e:
+        print(f"DEBUG: Anthropic library not available: {e}")
+        return "Error: Anthropic library not available. Please install with: pip install anthropic"
     except Exception as e:
         print(f"DEBUG: Exception calling Anthropic: {e}")
-        return f"Error calling Anthropic: {str(e)}"
+        # Try to provide more helpful error messages
+        if "proxies" in str(e):
+            return "Error: Anthropic configuration issue. Please check API key and model name."
+        elif "authentication" in str(e).lower():
+            return "Error: Invalid Anthropic API key. Please check your API key configuration."
+        elif "model" in str(e).lower():
+            return f"Error: Invalid model '{ANTHROPIC_MODEL}'. Please check model name."
+        else:
+            return f"Error calling Anthropic: {str(e)}"
 
 def call_ollama(prompt, system_prompt=""):
     """Call Ollama API with the given prompt"""

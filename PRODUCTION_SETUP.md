@@ -95,13 +95,23 @@ python app.py
 - Check environment variables on Render
 - Ensure `AI_SERVICE=anthropic` is set
 
-#### 2. "Rate limit exceeded"
+#### 2. "Client._init_() got an unexpected keyword argument 'proxies'"
+- This is a version compatibility issue
+- **Solution**: Use `anthropic==0.25.0` or later
+- **Fix**: Update requirements.txt and redeploy
+
+#### 3. "Rate limit exceeded"
 - Anthropic has generous free tier limits
 - Check your usage in Anthropic Console
 
-#### 3. "Model not found"
+#### 4. "Model not found"
 - Check `ANTHROPIC_MODEL` environment variable
 - Use valid model names like `claude-3-5-sonnet-20241022`
+
+#### 5. "Authentication failed"
+- Verify your API key is correct
+- Check if the key has expired
+- Ensure the key has proper permissions
 
 ## Security Notes
 
