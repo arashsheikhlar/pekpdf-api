@@ -52,7 +52,7 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-haiku-20240307")
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022")
 
 def call_ai_service(prompt, system_prompt=""):
     """Call AI service (Ollama, OpenAI, or Anthropic) based on configuration"""
@@ -96,21 +96,24 @@ def call_anthropic(prompt, system_prompt=""):
     
     try:
         import anthropic
-        anthropic.api_key = ANTHROPIC_API_KEY
         
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        
+        # Prepare messages
         messages = []
         if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        messages.append({"role": "user", "content": prompt})
+            messages.append({"role": "user", "content": f"System: {system_prompt}\n\nUser: {prompt}"})
+        else:
+            messages.append({"role": "user", "content": prompt})
         
-        response = anthropic.Anthropic.start_completion(
+        response = client.messages.create(
             model=ANTHROPIC_MODEL,
-            prompt=anthropic.HUMAN_PROMPT + prompt + anthropic.AI_PROMPT,
+            messages=messages,
             max_tokens=1000,
             temperature=0.7
         )
         
-        return response.completion
+        return response.content[0].text
     except Exception as e:
         print(f"DEBUG: Exception calling Anthropic: {e}")
         return f"Error calling Anthropic: {str(e)}"

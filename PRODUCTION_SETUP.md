@@ -23,7 +23,7 @@ In your Render dashboard:
    ```
    AI_SERVICE=anthropic
    ANTHROPIC_API_KEY=your_anthropic_api_key_here
-   ANTHROPIC_MODEL=claude-3-haiku-20240307
+   ANTHROPIC_MODEL=claude-3-5-sonnet-20241022
    ```
 
 #### 3. Deploy
@@ -57,7 +57,7 @@ OLLAMA_MODEL=llama3.1:8b
 ```env
 AI_SERVICE=anthropic
 ANTHROPIC_API_KEY=your_key_here
-ANTHROPIC_MODEL=claude-3-haiku-20240307
+ANTHROPIC_MODEL=claude-3-5-sonnet-20241022
 ```
 
 ## Cost Considerations
@@ -101,7 +101,7 @@ python app.py
 
 #### 3. "Model not found"
 - Check `ANTHROPIC_MODEL` environment variable
-- Use valid model names like `claude-3-haiku-20240307`
+- Use valid model names like `claude-3-5-sonnet-20241022`
 
 ## Security Notes
 
