@@ -36,9 +36,45 @@ import json
 # Load environment variables from .env file
 load_dotenv()
 
-# Ollama configuration
+# AI Service configuration
+AI_SERVICE = os.getenv("AI_SERVICE", "ollama")  # "ollama" or "openai"
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
+
+def call_ai_service(prompt, system_prompt=""):
+    """Call AI service (Ollama or OpenAI) based on configuration"""
+    if AI_SERVICE == "openai":
+        return call_openai(prompt, system_prompt)
+    else:
+        return call_ollama(prompt, system_prompt)
+
+def call_openai(prompt, system_prompt=""):
+    """Call OpenAI API with the given prompt"""
+    if not OPENAI_API_KEY:
+        return "Error: OpenAI API key not configured. Set OPENAI_API_KEY environment variable."
+    
+    try:
+        import openai
+        openai.api_key = OPENAI_API_KEY
+        
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+        
+        response = openai.ChatCompletion.create(
+            model=OPENAI_MODEL,
+            messages=messages,
+            max_tokens=1000,
+            temperature=0.7
+        )
+        
+        return response.choices[0].message.content
+    except Exception as e:
+        print(f"DEBUG: Exception calling OpenAI: {e}")
+        return f"Error calling OpenAI: {str(e)}"
 
 def call_ollama(prompt, system_prompt=""):
     """Call Ollama API with the given prompt"""
@@ -1135,7 +1171,7 @@ Answer this specific question based on the PDF content above. Be specific and re
 
         # Call Ollama with debugging and fallback
         print(f"DEBUG: Sending prompt to Ollama (first 300 chars): {prompt[:300]}")
-        ai_response_text = call_ollama(prompt)
+        ai_response_text = call_ai_service(prompt)
         print(f"DEBUG: Ollama response: {ai_response_text[:200]}")
         
         # If Ollama is not available, provide a contextual response
@@ -1186,7 +1222,7 @@ RETURN JSON with fields: summary, key_topics (array), main_points (array), recom
 """
         
         # Call Ollama
-        ai_response_text = call_ollama(prompt)
+        ai_response_text = call_ai_service(prompt)
         
         try:
             # Try to parse the response as JSON
@@ -1250,7 +1286,7 @@ RETURN JSON with fields: question, answer, confidence, suggested_followup (array
 """
         
         # Call Ollama
-        ai_response_text = call_ollama(prompt)
+        ai_response_text = call_ai_service(prompt)
         
         try:
             # Try to parse the response as JSON
@@ -1305,7 +1341,7 @@ RETURN JSON with fields: summary, key_topics (array), main_points (array), recom
 """
         
         # Call Ollama
-        ai_response_text = call_ollama(prompt)
+        ai_response_text = call_ai_service(prompt)
         
         try:
             # Try to parse the response as JSON
