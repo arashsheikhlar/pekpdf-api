@@ -56,11 +56,18 @@ ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022")
 
 def call_ai_service(prompt, system_prompt=""):
     """Call AI service (Ollama, OpenAI, or Anthropic) based on configuration"""
+    print(f"DEBUG: AI_SERVICE = '{AI_SERVICE}'")
+    print(f"DEBUG: ANTHROPIC_API_KEY exists = {bool(ANTHROPIC_API_KEY)}")
+    print(f"DEBUG: ANTHROPIC_MODEL = '{ANTHROPIC_MODEL}'")
+    
     if AI_SERVICE == "openai":
+        print("DEBUG: Calling OpenAI")
         return call_openai(prompt, system_prompt)
     elif AI_SERVICE == "anthropic":
+        print("DEBUG: Calling Anthropic")
         return call_anthropic(prompt, system_prompt)
     else:
+        print(f"DEBUG: Defaulting to Ollama (AI_SERVICE='{AI_SERVICE}')")
         return call_ollama(prompt, system_prompt)
 
 def call_openai(prompt, system_prompt=""):
@@ -91,16 +98,25 @@ def call_openai(prompt, system_prompt=""):
 
 def call_anthropic(prompt, system_prompt=""):
     """Call Anthropic API with the given prompt"""
+    print(f"DEBUG: call_anthropic called with prompt length: {len(prompt)}")
+    print(f"DEBUG: ANTHROPIC_API_KEY length: {len(ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else 0}")
+    print(f"DEBUG: ANTHROPIC_MODEL: {ANTHROPIC_MODEL}")
+    
     if not ANTHROPIC_API_KEY:
+        print("DEBUG: No ANTHROPIC_API_KEY found")
         return "Error: Anthropic API key not configured. Set ANTHROPIC_API_KEY environment variable."
     
     try:
+        print("DEBUG: Importing anthropic library...")
         import anthropic
+        print(f"DEBUG: Anthropic imported successfully, version: {anthropic.__version__}")
         
+        print("DEBUG: Creating Anthropic client...")
         # Create client with minimal configuration to avoid compatibility issues
         client = anthropic.Anthropic(
             api_key=ANTHROPIC_API_KEY,
         )
+        print("DEBUG: Client created successfully")
         
         # Prepare messages
         messages = []
@@ -109,6 +125,7 @@ def call_anthropic(prompt, system_prompt=""):
         else:
             messages.append({"role": "user", "content": prompt})
         
+        print(f"DEBUG: Making API call to model: {ANTHROPIC_MODEL}")
         response = client.messages.create(
             model=ANTHROPIC_MODEL,
             messages=messages,
@@ -116,6 +133,7 @@ def call_anthropic(prompt, system_prompt=""):
             temperature=0.7
         )
         
+        print("DEBUG: API call successful")
         return response.content[0].text
         
     except ImportError as e:
@@ -123,6 +141,8 @@ def call_anthropic(prompt, system_prompt=""):
         return "Error: Anthropic library not available. Please install with: pip install anthropic"
     except Exception as e:
         print(f"DEBUG: Exception calling Anthropic: {e}")
+        print(f"DEBUG: Exception type: {type(e).__name__}")
+        print(f"DEBUG: Exception args: {e.args}")
         # Try to provide more helpful error messages
         if "proxies" in str(e):
             return "Error: Anthropic configuration issue. Please check API key and model name."
