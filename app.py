@@ -25,6 +25,7 @@ import fitz                     # PyMuPDF, for PDF → JPG/PNG
 from pdfminer.high_level import extract_text_to_fp
 from pdfminer.layout import LAParams
 import pdfplumber
+import sys
 
 # Try to import pandas, but make it optional
 try:
@@ -65,6 +66,9 @@ print(f"OLLAMA_BASE_URL: {OLLAMA_BASE_URL}")
 print(f"OLLAMA_MODEL: {OLLAMA_MODEL}")
 print("================================")
 
+# Force flush to ensure logs are visible
+sys.stdout.flush()
+
 # Valid Anthropic models for validation
 VALID_ANTHROPIC_MODELS = [
     "claude-3-5-sonnet-20241022",
@@ -81,15 +85,19 @@ def call_ai_service(prompt, system_prompt=""):
     print(f"DEBUG: ANTHROPIC_API_KEY exists = {bool(ANTHROPIC_API_KEY)}")
     print(f"DEBUG: ANTHROPIC_MODEL = '{ANTHROPIC_MODEL}'")
     print(f"DEBUG: Environment variables loaded: AI_SERVICE={os.getenv('AI_SERVICE')}, ANTHROPIC_API_KEY={'SET' if os.getenv('ANTHROPIC_API_KEY') else 'NOT SET'}")
+    sys.stdout.flush()
     
     if AI_SERVICE == "openai":
         print("DEBUG: Calling OpenAI")
+        sys.stdout.flush()
         return call_openai(prompt, system_prompt)
     elif AI_SERVICE == "anthropic":
         print("DEBUG: Calling Anthropic")
+        sys.stdout.flush()
         return call_anthropic(prompt, system_prompt)
     else:
         print(f"DEBUG: Defaulting to Ollama (AI_SERVICE='{AI_SERVICE}')")
+        sys.stdout.flush()
         return call_ollama(prompt, system_prompt)
 
 def call_openai(prompt, system_prompt=""):
@@ -123,27 +131,34 @@ def call_anthropic(prompt, system_prompt=""):
     print(f"DEBUG: call_anthropic called with prompt length: {len(prompt)}")
     print(f"DEBUG: ANTHROPIC_API_KEY length: {len(ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else 0}")
     print(f"DEBUG: ANTHROPIC_MODEL: {ANTHROPIC_MODEL}")
+    sys.stdout.flush()
     
     if not ANTHROPIC_API_KEY:
         print("DEBUG: No ANTHROPIC_API_KEY found")
+        sys.stdout.flush()
         return "Error: Anthropic API key not configured. Set ANTHROPIC_API_KEY environment variable."
     
     # Validate model name
     if ANTHROPIC_MODEL not in VALID_ANTHROPIC_MODELS:
         print(f"DEBUG: Invalid model '{ANTHROPIC_MODEL}'. Valid models: {VALID_ANTHROPIC_MODELS}")
+        sys.stdout.flush()
         return f"Error: Invalid Anthropic model '{ANTHROPIC_MODEL}'. Valid models are: {', '.join(VALID_ANTHROPIC_MODELS)}"
     
     try:
         print("DEBUG: Importing anthropic library...")
+        sys.stdout.flush()
         import anthropic
         print(f"DEBUG: Anthropic imported successfully, version: {anthropic.__version__}")
+        sys.stdout.flush()
         
         print("DEBUG: Creating Anthropic client...")
+        sys.stdout.flush()
         # Create client with minimal configuration to avoid compatibility issues
         client = anthropic.Anthropic(
             api_key=ANTHROPIC_API_KEY,
         )
         print("DEBUG: Client created successfully")
+        sys.stdout.flush()
         
         # Prepare messages
         messages = []
@@ -153,6 +168,7 @@ def call_anthropic(prompt, system_prompt=""):
             messages.append({"role": "user", "content": prompt})
         
         print(f"DEBUG: Making API call to model: {ANTHROPIC_MODEL}")
+        sys.stdout.flush()
         response = client.messages.create(
             model=ANTHROPIC_MODEL,
             messages=messages,
@@ -161,15 +177,18 @@ def call_anthropic(prompt, system_prompt=""):
         )
         
         print("DEBUG: API call successful")
+        sys.stdout.flush()
         return response.content[0].text
         
     except ImportError as e:
         print(f"DEBUG: Anthropic library not available: {e}")
+        sys.stdout.flush()
         return "Error: Anthropic library not available. Please install with: pip install anthropic"
     except Exception as e:
         print(f"DEBUG: Exception calling Anthropic: {e}")
         print(f"DEBUG: Exception type: {type(e).__name__}")
         print(f"DEBUG: Exception args: {e.args}")
+        sys.stdout.flush()
         # Try to provide more helpful error messages
         error_str = str(e).lower()
         if "proxies" in error_str:
@@ -1320,11 +1339,15 @@ Answer this specific question based on the PDF content above. Be specific and re
         # Call AI service with debugging and fallback
         print(f"DEBUG: Sending prompt to AI service (first 300 chars): {prompt[:300]}")
         print(f"DEBUG: About to call call_ai_service with AI_SERVICE={AI_SERVICE}")
+        sys.stdout.flush()
         ai_response_text = call_ai_service(prompt)
         print(f"DEBUG: AI service response: {ai_response_text[:200]}")
+        sys.stdout.flush()
         
         # If AI service is not available, provide a contextual response
         if "Error" in ai_response_text:
+            print(f"DEBUG: AI service returned error: {ai_response_text}")
+            sys.stdout.flush()
             ai_response_text = f"Based on your question '{question}' about this {len(pdf_reader.pages)}-page PDF document, I can see the content but there's an issue with the AI service: {ai_response_text}. The document appears to contain: {text_content[:300]}..."
         
         ai_response = {
