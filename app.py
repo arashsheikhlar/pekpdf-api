@@ -54,6 +54,17 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022")
 
+# Print configuration at startup for debugging
+print("=== AI SERVICE CONFIGURATION ===")
+print(f"AI_SERVICE: {AI_SERVICE}")
+print(f"ANTHROPIC_API_KEY: {'SET' if ANTHROPIC_API_KEY else 'NOT SET'}")
+print(f"ANTHROPIC_MODEL: {ANTHROPIC_MODEL}")
+print(f"OPENAI_API_KEY: {'SET' if OPENAI_API_KEY else 'NOT SET'}")
+print(f"OPENAI_MODEL: {OPENAI_MODEL}")
+print(f"OLLAMA_BASE_URL: {OLLAMA_BASE_URL}")
+print(f"OLLAMA_MODEL: {OLLAMA_MODEL}")
+print("================================")
+
 # Valid Anthropic models for validation
 VALID_ANTHROPIC_MODELS = [
     "claude-3-5-sonnet-20241022",
@@ -69,6 +80,7 @@ def call_ai_service(prompt, system_prompt=""):
     print(f"DEBUG: AI_SERVICE = '{AI_SERVICE}'")
     print(f"DEBUG: ANTHROPIC_API_KEY exists = {bool(ANTHROPIC_API_KEY)}")
     print(f"DEBUG: ANTHROPIC_MODEL = '{ANTHROPIC_MODEL}'")
+    print(f"DEBUG: Environment variables loaded: AI_SERVICE={os.getenv('AI_SERVICE')}, ANTHROPIC_API_KEY={'SET' if os.getenv('ANTHROPIC_API_KEY') else 'NOT SET'}")
     
     if AI_SERVICE == "openai":
         print("DEBUG: Calling OpenAI")
@@ -332,6 +344,43 @@ def root():
 def health():
     """Used by React (and uptime checks) to verify API is alive."""
     return jsonify(status="ok"), 200
+
+@app.get("/api/ai-config")
+def ai_config():
+    """Debug endpoint to check AI service configuration"""
+    return jsonify({
+        "ai_service": AI_SERVICE,
+        "anthropic_api_key_set": bool(ANTHROPIC_API_KEY),
+        "anthropic_model": ANTHROPIC_MODEL,
+        "openai_api_key_set": bool(OPENAI_API_KEY),
+        "openai_model": OPENAI_MODEL,
+        "ollama_base_url": OLLAMA_BASE_URL,
+        "ollama_model": OLLAMA_MODEL,
+        "valid_anthropic_models": VALID_ANTHROPIC_MODELS
+    }), 200
+
+@app.get("/api/ai-test")
+def ai_test():
+    """Test endpoint to verify AI service is working"""
+    try:
+        print("DEBUG: Testing AI service...")
+        test_prompt = "Hello, this is a test. Please respond with 'AI service is working correctly.'"
+        response = call_ai_service(test_prompt)
+        print(f"DEBUG: AI test response: {response}")
+        return jsonify({
+            "status": "success",
+            "ai_service": AI_SERVICE,
+            "response": response,
+            "timestamp": str(datetime.now())
+        }), 200
+    except Exception as e:
+        print(f"DEBUG: AI test failed with error: {e}")
+        return jsonify({
+            "status": "error",
+            "ai_service": AI_SERVICE,
+            "error": str(e),
+            "timestamp": str(datetime.now())
+        }), 500
 
 
 # ── CONVERT (Unified) ─────────────────────────────────────────────────────
@@ -1268,14 +1317,15 @@ QUESTION: {question}
 
 Answer this specific question based on the PDF content above. Be specific and reference what you find in the document. If the question asks about something not in the document, say so clearly."""
 
-        # Call Ollama with debugging and fallback
-        print(f"DEBUG: Sending prompt to Ollama (first 300 chars): {prompt[:300]}")
+        # Call AI service with debugging and fallback
+        print(f"DEBUG: Sending prompt to AI service (first 300 chars): {prompt[:300]}")
+        print(f"DEBUG: About to call call_ai_service with AI_SERVICE={AI_SERVICE}")
         ai_response_text = call_ai_service(prompt)
-        print(f"DEBUG: Ollama response: {ai_response_text[:200]}")
+        print(f"DEBUG: AI service response: {ai_response_text[:200]}")
         
-        # If Ollama is not available, provide a contextual response
-        if "Error connecting to Ollama" in ai_response_text or "Error calling Ollama" in ai_response_text:
-            ai_response_text = f"Based on your question '{question}' about this {len(pdf_reader.pages)}-page PDF document, I can see the content but Ollama AI service is not running. To get AI-powered answers, please install and start Ollama. The document appears to contain: {text_content[:300]}..."
+        # If AI service is not available, provide a contextual response
+        if "Error" in ai_response_text:
+            ai_response_text = f"Based on your question '{question}' about this {len(pdf_reader.pages)}-page PDF document, I can see the content but there's an issue with the AI service: {ai_response_text}. The document appears to contain: {text_content[:300]}..."
         
         ai_response = {
             "message": ai_response_text.strip(),
