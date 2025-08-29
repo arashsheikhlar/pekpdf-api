@@ -54,6 +54,16 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022")
 
+# Valid Anthropic models for validation
+VALID_ANTHROPIC_MODELS = [
+    "claude-3-5-sonnet-20241022",
+    "claude-3-5-haiku-20241022", 
+    "claude-3-5-opus-20241022",
+    "claude-3-5-sonnet-20241022",
+    "claude-3-5-haiku-20241022",
+    "claude-3-5-opus-20241022"
+]
+
 def call_ai_service(prompt, system_prompt=""):
     """Call AI service (Ollama, OpenAI, or Anthropic) based on configuration"""
     print(f"DEBUG: AI_SERVICE = '{AI_SERVICE}'")
@@ -106,6 +116,11 @@ def call_anthropic(prompt, system_prompt=""):
         print("DEBUG: No ANTHROPIC_API_KEY found")
         return "Error: Anthropic API key not configured. Set ANTHROPIC_API_KEY environment variable."
     
+    # Validate model name
+    if ANTHROPIC_MODEL not in VALID_ANTHROPIC_MODELS:
+        print(f"DEBUG: Invalid model '{ANTHROPIC_MODEL}'. Valid models: {VALID_ANTHROPIC_MODELS}")
+        return f"Error: Invalid Anthropic model '{ANTHROPIC_MODEL}'. Valid models are: {', '.join(VALID_ANTHROPIC_MODELS)}"
+    
     try:
         print("DEBUG: Importing anthropic library...")
         import anthropic
@@ -144,12 +159,19 @@ def call_anthropic(prompt, system_prompt=""):
         print(f"DEBUG: Exception type: {type(e).__name__}")
         print(f"DEBUG: Exception args: {e.args}")
         # Try to provide more helpful error messages
-        if "proxies" in str(e):
+        error_str = str(e).lower()
+        if "proxies" in error_str:
             return "Error: Anthropic configuration issue. Please check API key and model name."
-        elif "authentication" in str(e).lower():
+        elif "authentication" in error_str or "unauthorized" in error_str or "invalid api key" in error_str:
             return "Error: Invalid Anthropic API key. Please check your API key configuration."
-        elif "model" in str(e).lower():
+        elif "model" in error_str or "not found" in error_str:
             return f"Error: Invalid model '{ANTHROPIC_MODEL}'. Please check model name."
+        elif "rate limit" in error_str or "too many requests" in error_str:
+            return "Error: Rate limit exceeded. Please try again later."
+        elif "quota" in error_str or "billing" in error_str:
+            return "Error: Billing/quota issue. Please check your Anthropic account."
+        elif "timeout" in error_str:
+            return "Error: Request timeout. Please try again."
         else:
             return f"Error calling Anthropic: {str(e)}"
 
