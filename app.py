@@ -153,12 +153,52 @@ def call_anthropic(prompt, system_prompt=""):
         
         print("DEBUG: Creating Anthropic client...")
         sys.stdout.flush()
+        
+        # Check for proxy-related environment variables that might cause issues
+        proxy_vars = ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY']
+        proxy_env = {k: v for k, v in os.environ.items() if k in proxy_vars and v}
+        if proxy_env:
+            print(f"DEBUG: Found proxy environment variables: {proxy_env}")
+            sys.stdout.flush()
+        
+        # Also check for any environment variables that might contain 'proxy'
+        all_proxy_vars = {k: v for k, v in os.environ.items() if 'proxy' in k.lower()}
+        if all_proxy_vars:
+            print(f"DEBUG: All proxy-related environment variables: {all_proxy_vars}")
+            sys.stdout.flush()
+        
         # Create client with minimal configuration to avoid compatibility issues
-        client = anthropic.Anthropic(
-            api_key=ANTHROPIC_API_KEY,
-        )
-        print("DEBUG: Client created successfully")
-        sys.stdout.flush()
+        try:
+            # First try with minimal configuration
+            client = anthropic.Anthropic(
+                api_key=ANTHROPIC_API_KEY,
+            )
+            print("DEBUG: Client created successfully")
+            sys.stdout.flush()
+        except TypeError as e:
+            if "proxies" in str(e):
+                print("DEBUG: Proxy configuration issue detected, trying alternative approach...")
+                sys.stdout.flush()
+                
+                # Try to clear proxy environment variables temporarily
+                original_proxy_vars = {}
+                for var in proxy_vars:
+                    if var in os.environ:
+                        original_proxy_vars[var] = os.environ[var]
+                        del os.environ[var]
+                
+                try:
+                    client = anthropic.Anthropic(
+                        api_key=ANTHROPIC_API_KEY,
+                    )
+                    print("DEBUG: Client created successfully (proxy vars cleared)")
+                    sys.stdout.flush()
+                finally:
+                    # Restore original proxy variables
+                    for var, value in original_proxy_vars.items():
+                        os.environ[var] = value
+            else:
+                raise e
         
         # Prepare messages
         messages = []
@@ -192,7 +232,7 @@ def call_anthropic(prompt, system_prompt=""):
         # Try to provide more helpful error messages
         error_str = str(e).lower()
         if "proxies" in error_str:
-            return "Error: Anthropic configuration issue. Please check API key and model name."
+            return "Error: Proxy configuration issue detected. This is likely due to environment variables set by your hosting provider. The system will attempt to work around this automatically."
         elif "authentication" in error_str or "unauthorized" in error_str or "invalid api key" in error_str:
             return "Error: Invalid Anthropic API key. Please check your API key configuration."
         elif "model" in error_str or "not found" in error_str:
@@ -400,6 +440,20 @@ def ai_test():
             "error": str(e),
             "timestamp": str(datetime.now())
         }), 500
+
+@app.get("/api/env-check")
+def env_check():
+    """Debug endpoint to check environment variables"""
+    proxy_vars = ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy']
+    all_proxy_vars = {k: v for k, v in os.environ.items() if 'proxy' in k.lower()}
+    
+    return jsonify({
+        "proxy_environment_variables": {k: v for k, v in os.environ.items() if k in proxy_vars},
+        "all_proxy_related_vars": all_proxy_vars,
+        "ai_service": AI_SERVICE,
+        "anthropic_api_key_set": bool(ANTHROPIC_API_KEY),
+        "anthropic_model": ANTHROPIC_MODEL
+    }), 200
 
 
 # ── CONVERT (Unified) ─────────────────────────────────────────────────────
