@@ -151,6 +151,17 @@ def call_anthropic(prompt, system_prompt=""):
         print(f"DEBUG: Anthropic imported successfully, version: {anthropic.__version__}")
         sys.stdout.flush()
         
+        # Check if there are any global proxy settings in the requests library
+        try:
+            import requests
+            print(f"DEBUG: Requests library version: {requests.__version__}")
+            if hasattr(requests, 'proxies'):
+                print(f"DEBUG: Requests global proxies: {getattr(requests, 'proxies', 'Not set')}")
+            sys.stdout.flush()
+        except Exception as e:
+            print(f"DEBUG: Could not check requests library: {e}")
+            sys.stdout.flush()
+        
         print("DEBUG: Creating Anthropic client...")
         sys.stdout.flush()
         
@@ -167,38 +178,47 @@ def call_anthropic(prompt, system_prompt=""):
             print(f"DEBUG: All proxy-related environment variables: {all_proxy_vars}")
             sys.stdout.flush()
         
+        # Check for any other environment variables that might affect HTTP requests
+        http_vars = {k: v for k, v in os.environ.items() if any(x in k.lower() for x in ['http', 'https', 'ssl', 'cert', 'ca'])}
+        if http_vars:
+            print(f"DEBUG: HTTP/HTTPS related environment variables: {http_vars}")
+            sys.stdout.flush()
+        
         # Create client with minimal configuration to avoid compatibility issues
+        print("DEBUG: Attempting to create Anthropic client...")
+        sys.stdout.flush()
+        
+        # Clear ALL proxy-related environment variables before creating client
+        all_proxy_vars = {k: v for k, v in os.environ.items() if 'proxy' in k.lower()}
+        if all_proxy_vars:
+            print(f"DEBUG: Found proxy variables, clearing them: {all_proxy_vars}")
+            sys.stdout.flush()
+            
+            # Store original values
+            original_proxy_vars = all_proxy_vars.copy()
+            
+            # Clear all proxy variables
+            for var in all_proxy_vars:
+                del os.environ[var]
+        
         try:
-            # First try with minimal configuration
+            # Create client after clearing proxy variables
             client = anthropic.Anthropic(
                 api_key=ANTHROPIC_API_KEY,
             )
             print("DEBUG: Client created successfully")
             sys.stdout.flush()
-        except TypeError as e:
-            if "proxies" in str(e):
-                print("DEBUG: Proxy configuration issue detected, trying alternative approach...")
+        except Exception as e:
+            print(f"DEBUG: Client creation failed: {e}")
+            sys.stdout.flush()
+            raise e
+        finally:
+            # Restore original proxy variables
+            if 'original_proxy_vars' in locals():
+                for var, value in original_proxy_vars.items():
+                    os.environ[var] = value
+                print("DEBUG: Restored proxy environment variables")
                 sys.stdout.flush()
-                
-                # Try to clear proxy environment variables temporarily
-                original_proxy_vars = {}
-                for var in proxy_vars:
-                    if var in os.environ:
-                        original_proxy_vars[var] = os.environ[var]
-                        del os.environ[var]
-                
-                try:
-                    client = anthropic.Anthropic(
-                        api_key=ANTHROPIC_API_KEY,
-                    )
-                    print("DEBUG: Client created successfully (proxy vars cleared)")
-                    sys.stdout.flush()
-                finally:
-                    # Restore original proxy variables
-                    for var, value in original_proxy_vars.items():
-                        os.environ[var] = value
-            else:
-                raise e
         
         # Prepare messages
         messages = []
@@ -446,13 +466,30 @@ def env_check():
     """Debug endpoint to check environment variables"""
     proxy_vars = ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy']
     all_proxy_vars = {k: v for k, v in os.environ.items() if 'proxy' in k.lower()}
+    http_vars = {k: v for k, v in os.environ.items() if any(x in k.lower() for x in ['http', 'https', 'ssl', 'cert', 'ca'])}
+    
+    # Check requests library configuration
+    requests_info = {}
+    try:
+        import requests
+        requests_info = {
+            "version": requests.__version__,
+            "global_proxies": getattr(requests, 'proxies', 'Not set'),
+            "session_proxies": getattr(requests.Session(), 'proxies', 'Not set')
+        }
+    except Exception as e:
+        requests_info = {"error": str(e)}
     
     return jsonify({
         "proxy_environment_variables": {k: v for k, v in os.environ.items() if k in proxy_vars},
         "all_proxy_related_vars": all_proxy_vars,
+        "http_https_vars": http_vars,
+        "requests_library_info": requests_info,
         "ai_service": AI_SERVICE,
         "anthropic_api_key_set": bool(ANTHROPIC_API_KEY),
-        "anthropic_model": ANTHROPIC_MODEL
+        "anthropic_model": ANTHROPIC_MODEL,
+        "total_env_vars": len(os.environ),
+        "sample_env_vars": dict(list(os.environ.items())[:10])  # First 10 env vars
     }), 200
 
 
