@@ -201,8 +201,46 @@ def call_anthropic(prompt, system_prompt=""):
             for var in all_proxy_vars:
                 del os.environ[var]
         
+        # Check if there are any global proxy settings that might be interfering
+        try:
+            import requests
+            if hasattr(requests, 'proxies') and requests.proxies:
+                print(f"DEBUG: Found global requests proxies: {requests.proxies}")
+                sys.stdout.flush()
+                # Clear global requests proxies temporarily
+                original_requests_proxies = requests.proxies
+                requests.proxies = {}
+        except Exception as e:
+            print(f"DEBUG: Could not check requests proxies: {e}")
+            sys.stdout.flush()
+        
+        # Check httpx library (which Anthropic uses internally)
+        try:
+            import httpx
+            print(f"DEBUG: httpx library version: {httpx.__version__}")
+            # Check if httpx has any global proxy settings
+            if hasattr(httpx, 'proxies'):
+                print(f"DEBUG: httpx global proxies: {getattr(httpx, 'proxies', 'Not set')}")
+            sys.stdout.flush()
+        except Exception as e:
+            print(f"DEBUG: Could not check httpx: {e}")
+            sys.stdout.flush()
+        
+        # Check for any other HTTP client libraries that might have proxy settings
+        try:
+            import urllib3
+            print(f"DEBUG: urllib3 library version: {urllib3.__version__}")
+            sys.stdout.flush()
+        except Exception as e:
+            print(f"DEBUG: Could not check urllib3: {e}")
+            sys.stdout.flush()
+        
         try:
             # Create client after clearing proxy variables
+            print(f"DEBUG: Creating client with api_key length: {len(ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else 0}")
+            sys.stdout.flush()
+            
+            # Try to create client with explicit no-proxy settings
             client = anthropic.Anthropic(
                 api_key=ANTHROPIC_API_KEY,
             )
@@ -210,8 +248,64 @@ def call_anthropic(prompt, system_prompt=""):
             sys.stdout.flush()
         except Exception as e:
             print(f"DEBUG: Client creation failed: {e}")
+            print(f"DEBUG: Error type: {type(e).__name__}")
+            print(f"DEBUG: Error args: {e.args}")
             sys.stdout.flush()
-            raise e
+            
+            # If it's still a proxies error, try a different approach
+            if "proxies" in str(e):
+                print("DEBUG: Still getting proxies error, trying alternative client creation...")
+                sys.stdout.flush()
+                
+                # Try to create client with explicit no-proxy configuration
+                try:
+                    # Import and check what arguments the client actually accepts
+                    import inspect
+                    client_signature = inspect.signature(anthropic.Anthropic.__init__)
+                    print(f"DEBUG: Anthropic client constructor signature: {client_signature}")
+                    sys.stdout.flush()
+                    
+                    # Create client with only the api_key parameter
+                    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+                    print("DEBUG: Client created successfully with minimal parameters")
+                    sys.stdout.flush()
+                except Exception as alt_e:
+                    print(f"DEBUG: Alternative approach also failed: {alt_e}")
+                    sys.stdout.flush()
+                    
+                    # Last resort: try to create client in a completely isolated way
+                    try:
+                        print("DEBUG: Trying completely isolated client creation...")
+                        sys.stdout.flush()
+                        
+                        # Save current environment
+                        original_env = os.environ.copy()
+                        
+                        # Clear ALL environment variables that might affect HTTP clients
+                        http_env_vars = [k for k in os.environ.keys() if any(x in k.lower() for x in ['proxy', 'http', 'https', 'ssl', 'cert', 'ca'])]
+                        for var in http_env_vars:
+                            del os.environ[var]
+                        
+                        print(f"DEBUG: Cleared {len(http_env_vars)} HTTP-related environment variables")
+                        sys.stdout.flush()
+                        
+                        # Try to create client in clean environment
+                        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+                        print("DEBUG: Client created successfully in isolated environment")
+                        sys.stdout.flush()
+                        
+                    except Exception as isolated_e:
+                        print(f"DEBUG: Isolated approach also failed: {isolated_e}")
+                        sys.stdout.flush()
+                        raise isolated_e
+                    finally:
+                        # Restore original environment
+                        os.environ.clear()
+                        os.environ.update(original_env)
+                        print("DEBUG: Restored original environment")
+                        sys.stdout.flush()
+            else:
+                raise e
         finally:
             # Restore original proxy variables
             if 'original_proxy_vars' in locals():
@@ -219,6 +313,16 @@ def call_anthropic(prompt, system_prompt=""):
                     os.environ[var] = value
                 print("DEBUG: Restored proxy environment variables")
                 sys.stdout.flush()
+            
+            # Restore requests proxies if we modified them
+            if 'original_requests_proxies' in locals():
+                try:
+                    requests.proxies = original_requests_proxies
+                    print("DEBUG: Restored requests proxies")
+                    sys.stdout.flush()
+                except Exception as e:
+                    print(f"DEBUG: Could not restore requests proxies: {e}")
+                    sys.stdout.flush()
         
         # Prepare messages
         messages = []
@@ -480,16 +584,41 @@ def env_check():
     except Exception as e:
         requests_info = {"error": str(e)}
     
+    # Check httpx library configuration
+    httpx_info = {}
+    try:
+        import httpx
+        httpx_info = {
+            "version": httpx.__version__,
+            "available": True
+        }
+    except Exception as e:
+        httpx_info = {"error": str(e), "available": False}
+    
+    # Check urllib3 library configuration
+    urllib3_info = {}
+    try:
+        import urllib3
+        urllib3_info = {
+            "version": urllib3.__version__,
+            "available": True
+        }
+    except Exception as e:
+        urllib3_info = {"error": str(e), "available": False}
+    
     return jsonify({
         "proxy_environment_variables": {k: v for k, v in os.environ.items() if k in proxy_vars},
         "all_proxy_related_vars": all_proxy_vars,
         "http_https_vars": http_vars,
         "requests_library_info": requests_info,
+        "httpx_library_info": httpx_info,
+        "urllib3_library_info": urllib3_info,
         "ai_service": AI_SERVICE,
         "anthropic_api_key_set": bool(ANTHROPIC_API_KEY),
         "anthropic_model": ANTHROPIC_MODEL,
         "total_env_vars": len(os.environ),
-        "sample_env_vars": dict(list(os.environ.items())[:10])  # First 10 env vars
+        "sample_env_vars": dict(list(os.environ.items())[:10]),  # First 10 env vars
+        "all_env_vars": dict(os.environ)  # All environment variables
     }), 200
 
 
