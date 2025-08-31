@@ -241,11 +241,46 @@ def call_anthropic(prompt, system_prompt=""):
             sys.stdout.flush()
             
             # Try to create client with explicit no-proxy settings
-            client = anthropic.Anthropic(
-                api_key=ANTHROPIC_API_KEY,
-            )
-            print("DEBUG: Client created successfully")
+            # Use keyword arguments explicitly to avoid any automatic proxy injection
+            client_kwargs = {"api_key": ANTHROPIC_API_KEY}
+            print(f"DEBUG: Client kwargs: {client_kwargs}")
             sys.stdout.flush()
+            
+            # Check if there are any monkey-patched methods or decorators
+            print(f"DEBUG: Anthropic.Anthropic.__init__ type: {type(anthropic.Anthropic.__init__)}")
+            print(f"DEBUG: Anthropic.Anthropic.__init__.__name__: {anthropic.Anthropic.__init__.__name__}")
+            sys.stdout.flush()
+            
+            # Try to create client with explicit keyword arguments
+            try:
+                client = anthropic.Anthropic(**client_kwargs)
+                print("DEBUG: Client created successfully")
+                sys.stdout.flush()
+            except Exception as e:
+                print(f"DEBUG: Direct call failed: {e}")
+                print(f"DEBUG: Error type: {type(e).__name__}")
+                sys.stdout.flush()
+                
+                # Try to call the constructor directly without any potential interference
+                try:
+                    print("DEBUG: Trying direct constructor call...")
+                    sys.stdout.flush()
+                    
+                    # Get the actual constructor method
+                    constructor = anthropic.Anthropic.__init__
+                    print(f"DEBUG: Constructor method: {constructor}")
+                    sys.stdout.flush()
+                    
+                    # Create an instance and call constructor manually
+                    instance = object.__new__(anthropic.Anthropic)
+                    constructor(instance, **client_kwargs)
+                    client = instance
+                    print("DEBUG: Client created successfully with manual constructor call")
+                    sys.stdout.flush()
+                except Exception as manual_e:
+                    print(f"DEBUG: Manual constructor call also failed: {manual_e}")
+                    sys.stdout.flush()
+                    raise e  # Re-raise the original error
         except Exception as e:
             print(f"DEBUG: Client creation failed: {e}")
             print(f"DEBUG: Error type: {type(e).__name__}")
@@ -266,7 +301,10 @@ def call_anthropic(prompt, system_prompt=""):
                     sys.stdout.flush()
                     
                     # Create client with only the api_key parameter
-                    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+                    client_kwargs = {"api_key": ANTHROPIC_API_KEY}
+                    print(f"DEBUG: Client kwargs (minimal): {client_kwargs}")
+                    sys.stdout.flush()
+                    client = anthropic.Anthropic(**client_kwargs)
                     print("DEBUG: Client created successfully with minimal parameters")
                     sys.stdout.flush()
                 except Exception as alt_e:
@@ -290,7 +328,10 @@ def call_anthropic(prompt, system_prompt=""):
                         sys.stdout.flush()
                         
                         # Try to create client in clean environment
-                        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+                        client_kwargs = {"api_key": ANTHROPIC_API_KEY}
+                        print(f"DEBUG: Client kwargs (isolated): {client_kwargs}")
+                        sys.stdout.flush()
+                        client = anthropic.Anthropic(**client_kwargs)
                         print("DEBUG: Client created successfully in isolated environment")
                         sys.stdout.flush()
                         
