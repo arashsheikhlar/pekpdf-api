@@ -53,7 +53,7 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "Claude Opus 4.x")
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-haiku")
 
 # Print configuration at startup for debugging
 print("=== AI SERVICE CONFIGURATION ===")
