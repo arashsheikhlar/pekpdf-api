@@ -53,7 +53,7 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-haiku")
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-haiku-20240307")
 
 # Print configuration at startup for debugging
 print("=== AI SERVICE CONFIGURATION ===")
@@ -72,14 +72,16 @@ sys.stdout.flush()
 # Valid Anthropic models for validation
 VALID_ANTHROPIC_MODELS = [
     "claude-3-5-sonnet-20241022",
-    "claude-3-5-haiku-20241022",
+    "claude-3-5-haiku-20241022", 
     "claude-3-haiku-20240307",
     "claude-3-sonnet-20240229",
     "claude-3-opus-20240229",
     "claude-3-5-sonnet",
     "claude-3-haiku",
     "claude-3-sonnet",
-    "claude-3-opus"
+    "claude-3-opus",
+    "claude-3-5-haiku",
+    "claude-3-5-opus"
 ]
 
 def call_ai_service(prompt, system_prompt=""):
