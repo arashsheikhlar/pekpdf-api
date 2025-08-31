@@ -127,7 +127,7 @@ def call_openai(prompt, system_prompt=""):
         return f"Error calling OpenAI: {str(e)}"
 
 def call_anthropic(prompt, system_prompt=""):
-    """Call Anthropic API with the given prompt"""
+    """Call Anthropic API with the given prompt using direct HTTP requests"""
     print(f"DEBUG: call_anthropic called with prompt length: {len(prompt)}")
     print(f"DEBUG: ANTHROPIC_API_KEY length: {len(ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else 0}")
     print(f"DEBUG: ANTHROPIC_MODEL: {ANTHROPIC_MODEL}")
@@ -145,271 +145,81 @@ def call_anthropic(prompt, system_prompt=""):
         return f"Error: Invalid Anthropic model '{ANTHROPIC_MODEL}'. Valid models are: {', '.join(VALID_ANTHROPIC_MODELS)}"
     
     try:
-        print("DEBUG: Importing anthropic library...")
-        sys.stdout.flush()
-        import anthropic
-        print(f"DEBUG: Anthropic imported successfully, version: {anthropic.__version__}")
+        print("DEBUG: Using direct HTTP requests to Anthropic API")
         sys.stdout.flush()
         
-        # Check if there are any global proxy settings in the requests library
-        try:
-            import requests
-            print(f"DEBUG: Requests library version: {requests.__version__}")
-            if hasattr(requests, 'proxies'):
-                print(f"DEBUG: Requests global proxies: {getattr(requests, 'proxies', 'Not set')}")
-            sys.stdout.flush()
-        except Exception as e:
-            print(f"DEBUG: Could not check requests library: {e}")
-            sys.stdout.flush()
-        
-        print("DEBUG: Creating Anthropic client...")
-        sys.stdout.flush()
-        
-        # Check for proxy-related environment variables that might cause issues
-        proxy_vars = ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY']
-        proxy_env = {k: v for k, v in os.environ.items() if k in proxy_vars and v}
-        if proxy_env:
-            print(f"DEBUG: Found proxy environment variables: {proxy_env}")
-            sys.stdout.flush()
-        
-        # Also check for any environment variables that might contain 'proxy'
-        all_proxy_vars = {k: v for k, v in os.environ.items() if 'proxy' in k.lower()}
-        if all_proxy_vars:
-            print(f"DEBUG: All proxy-related environment variables: {all_proxy_vars}")
-            sys.stdout.flush()
-        
-        # Check for any other environment variables that might affect HTTP requests
-        http_vars = {k: v for k, v in os.environ.items() if any(x in k.lower() for x in ['http', 'https', 'ssl', 'cert', 'ca'])}
-        if http_vars:
-            print(f"DEBUG: HTTP/HTTPS related environment variables: {http_vars}")
-            sys.stdout.flush()
-        
-        # Create client with minimal configuration to avoid compatibility issues
-        print("DEBUG: Attempting to create Anthropic client...")
-        sys.stdout.flush()
-        
-        # Clear ALL proxy-related environment variables before creating client
-        all_proxy_vars = {k: v for k, v in os.environ.items() if 'proxy' in k.lower()}
-        if all_proxy_vars:
-            print(f"DEBUG: Found proxy variables, clearing them: {all_proxy_vars}")
-            sys.stdout.flush()
-            
-            # Store original values
-            original_proxy_vars = all_proxy_vars.copy()
-            
-            # Clear all proxy variables
-            for var in all_proxy_vars:
-                del os.environ[var]
-        
-        # Check if there are any global proxy settings that might be interfering
-        try:
-            import requests
-            if hasattr(requests, 'proxies') and requests.proxies:
-                print(f"DEBUG: Found global requests proxies: {requests.proxies}")
-                sys.stdout.flush()
-                # Clear global requests proxies temporarily
-                original_requests_proxies = requests.proxies
-                requests.proxies = {}
-        except Exception as e:
-            print(f"DEBUG: Could not check requests proxies: {e}")
-            sys.stdout.flush()
-        
-        # Check httpx library (which Anthropic uses internally)
-        try:
-            import httpx
-            print(f"DEBUG: httpx library version: {httpx.__version__}")
-            # Check if httpx has any global proxy settings
-            if hasattr(httpx, 'proxies'):
-                print(f"DEBUG: httpx global proxies: {getattr(httpx, 'proxies', 'Not set')}")
-            sys.stdout.flush()
-        except Exception as e:
-            print(f"DEBUG: Could not check httpx: {e}")
-            sys.stdout.flush()
-        
-        # Check for any other HTTP client libraries that might have proxy settings
-        try:
-            import urllib3
-            print(f"DEBUG: urllib3 library version: {urllib3.__version__}")
-            sys.stdout.flush()
-        except Exception as e:
-            print(f"DEBUG: Could not check urllib3: {e}")
-            sys.stdout.flush()
-        
-        try:
-            # Create client after clearing proxy variables
-            print(f"DEBUG: Creating client with api_key length: {len(ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else 0}")
-            sys.stdout.flush()
-            
-            # Try to create client with explicit no-proxy settings
-            # Use keyword arguments explicitly to avoid any automatic proxy injection
-            client_kwargs = {"api_key": ANTHROPIC_API_KEY}
-            print(f"DEBUG: Client kwargs: {client_kwargs}")
-            sys.stdout.flush()
-            
-            # Check if there are any monkey-patched methods or decorators
-            print(f"DEBUG: Anthropic.Anthropic.__init__ type: {type(anthropic.Anthropic.__init__)}")
-            print(f"DEBUG: Anthropic.Anthropic.__init__.__name__: {anthropic.Anthropic.__init__.__name__}")
-            sys.stdout.flush()
-            
-            # Try to create client with explicit keyword arguments
-            try:
-                client = anthropic.Anthropic(**client_kwargs)
-                print("DEBUG: Client created successfully")
-                sys.stdout.flush()
-            except Exception as e:
-                print(f"DEBUG: Direct call failed: {e}")
-                print(f"DEBUG: Error type: {type(e).__name__}")
-                sys.stdout.flush()
-                
-                # Try to call the constructor directly without any potential interference
-                try:
-                    print("DEBUG: Trying direct constructor call...")
-                    sys.stdout.flush()
-                    
-                    # Get the actual constructor method
-                    constructor = anthropic.Anthropic.__init__
-                    print(f"DEBUG: Constructor method: {constructor}")
-                    sys.stdout.flush()
-                    
-                    # Create an instance and call constructor manually
-                    instance = object.__new__(anthropic.Anthropic)
-                    constructor(instance, **client_kwargs)
-                    client = instance
-                    print("DEBUG: Client created successfully with manual constructor call")
-                    sys.stdout.flush()
-                except Exception as manual_e:
-                    print(f"DEBUG: Manual constructor call also failed: {manual_e}")
-                    sys.stdout.flush()
-                    raise e  # Re-raise the original error
-        except Exception as e:
-            print(f"DEBUG: Client creation failed: {e}")
-            print(f"DEBUG: Error type: {type(e).__name__}")
-            print(f"DEBUG: Error args: {e.args}")
-            sys.stdout.flush()
-            
-            # If it's still a proxies error, try a different approach
-            if "proxies" in str(e):
-                print("DEBUG: Still getting proxies error, trying alternative client creation...")
-                sys.stdout.flush()
-                
-                # Try to create client with explicit no-proxy configuration
-                try:
-                    # Import and check what arguments the client actually accepts
-                    import inspect
-                    client_signature = inspect.signature(anthropic.Anthropic.__init__)
-                    print(f"DEBUG: Anthropic client constructor signature: {client_signature}")
-                    sys.stdout.flush()
-                    
-                    # Create client with only the api_key parameter
-                    client_kwargs = {"api_key": ANTHROPIC_API_KEY}
-                    print(f"DEBUG: Client kwargs (minimal): {client_kwargs}")
-                    sys.stdout.flush()
-                    client = anthropic.Anthropic(**client_kwargs)
-                    print("DEBUG: Client created successfully with minimal parameters")
-                    sys.stdout.flush()
-                except Exception as alt_e:
-                    print(f"DEBUG: Alternative approach also failed: {alt_e}")
-                    sys.stdout.flush()
-                    
-                    # Last resort: try to create client in a completely isolated way
-                    try:
-                        print("DEBUG: Trying completely isolated client creation...")
-                        sys.stdout.flush()
-                        
-                        # Save current environment
-                        original_env = os.environ.copy()
-                        
-                        # Clear ALL environment variables that might affect HTTP clients
-                        http_env_vars = [k for k in os.environ.keys() if any(x in k.lower() for x in ['proxy', 'http', 'https', 'ssl', 'cert', 'ca'])]
-                        for var in http_env_vars:
-                            del os.environ[var]
-                        
-                        print(f"DEBUG: Cleared {len(http_env_vars)} HTTP-related environment variables")
-                        sys.stdout.flush()
-                        
-                        # Try to create client in clean environment
-                        client_kwargs = {"api_key": ANTHROPIC_API_KEY}
-                        print(f"DEBUG: Client kwargs (isolated): {client_kwargs}")
-                        sys.stdout.flush()
-                        client = anthropic.Anthropic(**client_kwargs)
-                        print("DEBUG: Client created successfully in isolated environment")
-                        sys.stdout.flush()
-                        
-                    except Exception as isolated_e:
-                        print(f"DEBUG: Isolated approach also failed: {isolated_e}")
-                        sys.stdout.flush()
-                        raise isolated_e
-                    finally:
-                        # Restore original environment
-                        os.environ.clear()
-                        os.environ.update(original_env)
-                        print("DEBUG: Restored original environment")
-                        sys.stdout.flush()
-            else:
-                raise e
-        finally:
-            # Restore original proxy variables
-            if 'original_proxy_vars' in locals():
-                for var, value in original_proxy_vars.items():
-                    os.environ[var] = value
-                print("DEBUG: Restored proxy environment variables")
-                sys.stdout.flush()
-            
-            # Restore requests proxies if we modified them
-            if 'original_requests_proxies' in locals():
-                try:
-                    requests.proxies = original_requests_proxies
-                    print("DEBUG: Restored requests proxies")
-                    sys.stdout.flush()
-                except Exception as e:
-                    print(f"DEBUG: Could not restore requests proxies: {e}")
-                    sys.stdout.flush()
-        
-        # Prepare messages
+        # Prepare the request payload
         messages = []
         if system_prompt:
             messages.append({"role": "user", "content": f"System: {system_prompt}\n\nUser: {prompt}"})
         else:
             messages.append({"role": "user", "content": prompt})
         
-        print(f"DEBUG: Making API call to model: {ANTHROPIC_MODEL}")
+        payload = {
+            "model": ANTHROPIC_MODEL,
+            "messages": messages,
+            "max_tokens": 1000,
+            "temperature": 0.7
+        }
+        
+        headers = {
+            "Content-Type": "application/json",
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01"
+        }
+        
+        print(f"DEBUG: Making direct HTTP request to Anthropic API")
+        print(f"DEBUG: Model: {ANTHROPIC_MODEL}")
+        print(f"DEBUG: Payload keys: {list(payload.keys())}")
         sys.stdout.flush()
-        response = client.messages.create(
-            model=ANTHROPIC_MODEL,
-            messages=messages,
-            max_tokens=1000,
-            temperature=0.7
+        
+        # Make the HTTP request directly
+        import requests
+        response = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            json=payload,
+            headers=headers,
+            timeout=60
         )
         
-        print("DEBUG: API call successful")
+        print(f"DEBUG: HTTP response status: {response.status_code}")
         sys.stdout.flush()
-        return response.content[0].text
         
-    except ImportError as e:
-        print(f"DEBUG: Anthropic library not available: {e}")
-        sys.stdout.flush()
-        return "Error: Anthropic library not available. Please install with: pip install anthropic"
-    except Exception as e:
-        print(f"DEBUG: Exception calling Anthropic: {e}")
-        print(f"DEBUG: Exception type: {type(e).__name__}")
-        print(f"DEBUG: Exception args: {e.args}")
-        sys.stdout.flush()
-        # Try to provide more helpful error messages
-        error_str = str(e).lower()
-        if "proxies" in error_str:
-            return "Error: Proxy configuration issue detected. This is likely due to environment variables set by your hosting provider. The system will attempt to work around this automatically."
-        elif "authentication" in error_str or "unauthorized" in error_str or "invalid api key" in error_str:
-            return "Error: Invalid Anthropic API key. Please check your API key configuration."
-        elif "model" in error_str or "not found" in error_str:
-            return f"Error: Invalid model '{ANTHROPIC_MODEL}'. Please check model name."
-        elif "rate limit" in error_str or "too many requests" in error_str:
-            return "Error: Rate limit exceeded. Please try again later."
-        elif "quota" in error_str or "billing" in error_str:
-            return "Error: Billing/quota issue. Please check your Anthropic account."
-        elif "timeout" in error_str:
-            return "Error: Request timeout. Please try again."
+        if response.status_code == 200:
+            result = response.json()
+            print("DEBUG: API call successful")
+            sys.stdout.flush()
+            return result["content"][0]["text"]
         else:
-            return f"Error calling Anthropic: {str(e)}"
+            print(f"DEBUG: API call failed with status {response.status_code}")
+            print(f"DEBUG: Response text: {response.text[:200]}")
+            sys.stdout.flush()
+            
+            # Handle specific error cases
+            if response.status_code == 401:
+                return "Error: Invalid Anthropic API key. Please check your API key configuration."
+            elif response.status_code == 400:
+                return f"Error: Invalid request. Please check model name '{ANTHROPIC_MODEL}' and request format."
+            elif response.status_code == 429:
+                return "Error: Rate limit exceeded. Please try again later."
+            elif response.status_code == 500:
+                return "Error: Anthropic API server error. Please try again later."
+            else:
+                return f"Error: Anthropic API returned status {response.status_code}: {response.text[:100]}"
+        
+    except requests.exceptions.Timeout:
+        print("DEBUG: Request timeout")
+        sys.stdout.flush()
+        return "Error: Request timeout. Please try again."
+    except requests.exceptions.ConnectionError:
+        print("DEBUG: Connection error")
+        sys.stdout.flush()
+        return "Error: Connection error. Please check your internet connection."
+    except Exception as e:
+        print(f"DEBUG: Exception calling Anthropic API: {e}")
+        print(f"DEBUG: Exception type: {type(e).__name__}")
+        sys.stdout.flush()
+        return f"Error calling Anthropic API: {str(e)}"
 
 def call_ollama(prompt, system_prompt=""):
     """Call Ollama API with the given prompt"""
