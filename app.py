@@ -8,6 +8,8 @@ POST /api/merge       → streams merged PDF
 (no HTML rendered; UI lives in React/Vite front-end)
 """
 
+# SPDX-License-Identifier: AGPL-3.0-only
+
 # ── imports ──────────────────────────────────────────────────────
 from flask import (
     Flask, request, send_file, jsonify, after_this_request

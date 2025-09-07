@@ -3,6 +3,8 @@
 Startup script for Perk PDF Backend with Ollama integration
 """
 
+# SPDX-License-Identifier: AGPL-3.0-only
+
 import requests
 import time
 import sys

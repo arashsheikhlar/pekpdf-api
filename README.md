@@ -77,3 +77,9 @@ A web-based PDF toolbox that provides various PDF manipulation and conversion to
 - Delete Pages
 - Reorder Pages
 - Contact Form 
+
+## License
+
+Licensed under AGPL-3.0-only. See the `LICENSE` file for details.
+
+Copyright (c) 2025 Arash Sheikhlar 
