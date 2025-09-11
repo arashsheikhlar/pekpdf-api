@@ -1180,6 +1180,148 @@ def pdf_to_excel():
         mimetype=mimetype
     )
 
+# ── Route: OCR PDF ─────────────────────────────────────────────────────────
+@app.post("/api/ocr-pdf")
+def ocr_pdf():
+    """
+    OCR PDF endpoint:
+    1) Accept exactly one PDF upload
+    2) Convert PDF pages to images using PyMuPDF
+    3) Use pytesseract to extract text from each image
+    4) Combine all extracted text and return as .txt file
+    """
+    # 1) Validate exactly one PDF file was sent
+    files = request.files.getlist("file")
+    if len(files) != 1:
+        return jsonify(error="Upload exactly one PDF file"), 400
+
+    f = files[0]
+    if not allowed_pdf(f):
+        return jsonify(error="Only PDF files allowed"), 400
+
+    # 2) Save incoming PDF to a temp path
+    in_filename = f"{uuid.uuid4()}_{f.filename}"
+    in_path = os.path.join(app.config["UPLOAD_FOLDER"], in_filename)
+    f.save(in_path)
+
+    # 3) Open PDF with PyMuPDF and extract text using OCR
+    try:
+        import pytesseract
+        from PIL import Image
+        
+        # Open PDF document
+        pdf_document = fitz.open(in_path)
+        extracted_text = []
+        
+        # Process each page
+        for page_num in range(len(pdf_document)):
+            page = pdf_document[page_num]
+            
+            # Convert page to image
+            mat = fitz.Matrix(2.0, 2.0)  # Increase resolution for better OCR
+            pix = page.get_pixmap(matrix=mat)
+            img_data = pix.tobytes("png")
+            
+            # Convert to PIL Image
+            img = Image.open(io.BytesIO(img_data))
+            
+            # Perform OCR on the image
+            try:
+                page_text = pytesseract.image_to_string(img, lang='eng')
+                if page_text.strip():
+                    extracted_text.append(f"--- Page {page_num + 1} ---\n{page_text.strip()}\n")
+            except Exception as ocr_error:
+                print(f"OCR error on page {page_num + 1}: {ocr_error}")
+                # Fallback: try to extract text directly from PDF
+                page_text = page.get_text()
+                if page_text.strip():
+                    extracted_text.append(f"--- Page {page_num + 1} (Direct Text) ---\n{page_text.strip()}\n")
+        
+        pdf_document.close()
+        
+        # 4) Combine all text
+        full_text = "\n".join(extracted_text)
+        
+        if not full_text.strip():
+            os.remove(in_path)
+            return jsonify(error="No text could be extracted from the PDF"), 400
+        
+        # 5) Create output text file
+        out_filename = f"ocr_extracted_{uuid.uuid4()}.txt"
+        out_path = os.path.join(app.config["UPLOAD_FOLDER"], out_filename)
+        
+        with open(out_path, 'w', encoding='utf-8') as f:
+            f.write(full_text)
+        
+        # 6) Schedule cleanup
+        @after_this_request
+        def cleanup(response):
+            try:
+                os.remove(in_path)
+                os.remove(out_path)
+            except OSError:
+                pass
+            return response
+        
+        # 7) Return the text file
+        return send_file(
+            out_path,
+            as_attachment=True,
+            download_name="ocr_extracted_text.txt",
+            mimetype="text/plain; charset=utf-8"
+        )
+        
+    except ImportError:
+        # Fallback if pytesseract is not available
+        try:
+            pdf_document = fitz.open(in_path)
+            extracted_text = []
+            
+            for page_num in range(len(pdf_document)):
+                page = pdf_document[page_num]
+                page_text = page.get_text()
+                if page_text.strip():
+                    extracted_text.append(f"--- Page {page_num + 1} ---\n{page_text.strip()}\n")
+            
+            pdf_document.close()
+            
+            full_text = "\n".join(extracted_text)
+            
+            if not full_text.strip():
+                os.remove(in_path)
+                return jsonify(error="No text could be extracted from the PDF"), 400
+            
+            # Create output text file
+            out_filename = f"extracted_{uuid.uuid4()}.txt"
+            out_path = os.path.join(app.config["UPLOAD_FOLDER"], out_filename)
+            
+            with open(out_path, 'w', encoding='utf-8') as f:
+                f.write(full_text)
+            
+            @after_this_request
+            def cleanup(response):
+                try:
+                    os.remove(in_path)
+                    os.remove(out_path)
+                except OSError:
+                    pass
+                return response
+            
+            return send_file(
+                out_path,
+                as_attachment=True,
+                download_name="extracted_text.txt",
+                mimetype="text/plain; charset=utf-8"
+            )
+            
+        except Exception as e:
+            os.remove(in_path)
+            return jsonify(error=f"Cannot process PDF: {e}"), 400
+            
+    except Exception as e:
+        os.remove(in_path)
+        return jsonify(error=f"OCR processing failed: {e}"), 400
+
 # ── Route: Delete pages ─────────────────────────────────────────────────────────
 @app.post("/api/delete-pages")
 def delete_pages():

@@ -11,6 +11,7 @@ requests==2.31.0
 Werkzeug==2.3.7
 openai==0.28.1
 anthropic==0.25.0
+pytesseract==0.3.10
 # Lightweight alternatives for heavy packages
 # openpyxl==3.1.2  # Commented out - can cause issues
 # pandas and numpy commented out - can cause compatibility issues
