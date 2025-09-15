@@ -1489,6 +1489,12 @@ def pdf_to_peppol():
 
         # 4) Parse invoice data using regex patterns
         def extract_invoice_data(text):
+            # Clean the text first - remove invisible characters and normalize whitespace
+            import unicodedata
+            text = unicodedata.normalize('NFKD', text)  # Normalize unicode
+            text = re.sub(r'[\u200b-\u200d\ufeff]', '', text)  # Remove zero-width characters
+            text = re.sub(r'\s+', ' ', text)  # Normalize whitespace
+            
             data = {
                 'invoice_number': '',
                 'invoice_date': '',
@@ -1499,10 +1505,13 @@ def pdf_to_peppol():
                 'currency': 'EUR',
             }
             
-            # Extract invoice number
+            # Extract invoice number - improved patterns
             invoice_patterns = [
+                r'invoice\s+no[:\s]*([A-Z0-9\-]+)',
                 r'invoice\s*#?\s*:?\s*([A-Z0-9\-]+)',
                 r'inv\s*#?\s*:?\s*([A-Z0-9\-]+)',
+                r'invoice\s+number\s*:?\s*([A-Z0-9\-]+)',
+                r'bill\s*#?\s*:?\s*([A-Z0-9\-]+)'
             ]
             
             for pattern in invoice_patterns:
@@ -1511,24 +1520,31 @@ def pdf_to_peppol():
                     data['invoice_number'] = match.group(1)
                     break
             
-            # Extract dates
+            # Extract dates - improved patterns
             date_patterns = [
-                r'(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})',
-                r'(\d{4}[\/\-\.]\d{1,2}[\/\-\.]\d{1,2})'
+                r'issue\s+date[:\s]*(\d{4}[\/\-\.]\d{1,2}[\/\-\.]\d{1,2})',
+                r'date[:\s]*(\d{4}[\/\-\.]\d{1,2}[\/\-\.]\d{1,2})',
+                r'(\d{4}[\/\-\.]\d{1,2}[\/\-\.]\d{1,2})',
+                r'(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})'
             ]
             
             dates_found = []
             for pattern in date_patterns:
-                matches = re.findall(pattern, text)
+                matches = re.findall(pattern, text, re.IGNORECASE)
                 dates_found.extend(matches)
             
             if dates_found:
                 data['invoice_date'] = dates_found[0]
+                if len(dates_found) > 1:
+                    data['due_date'] = dates_found[1]
             
-            # Extract amounts
+            # Extract amounts - improved patterns
             amount_patterns = [
-                r'total\s*:?\s*[€$£]?\s*([\d,]+\.?\d*)',
-                r'amount\s+due\s*:?\s*[€$£]?\s*([\d,]+\.?\d*)',
+                r'total\s*\([^)]*\)[:\s]*[€$£]?\s*([\d,]+\.?\d*)',
+                r'total[:\s]*[€$£]?\s*([\d,]+\.?\d*)',
+                r'amount\s+due[:\s]*[€$£]?\s*([\d,]+\.?\d*)',
+                r'grand\s+total[:\s]*[€$£]?\s*([\d,]+\.?\d*)',
+                r'[€$£]\s*([\d,]+\.?\d*)\s*(?:total|due)'
             ]
             
             for pattern in amount_patterns:
@@ -1537,13 +1553,56 @@ def pdf_to_peppol():
                     data['total_amount'] = match.group(1).replace(',', '')
                     break
             
-            # Extract supplier name (usually at the top)
-            lines = text.split('\n')
-            for i, line in enumerate(lines[:10]):
-                if len(line.strip()) > 3 and not re.search(r'\d+', line):
-                    data['supplier_name'] = line.strip()
-                    break
+            # Extract supplier name - with debug output
+            print(f"[DEBUG] Looking for supplier in text: {repr(text[:200])}")
             
+            # Try multiple patterns
+            supplier_patterns = [
+                r'supplier[:\s]*([A-Za-zÀ-ÿ]+)\s+Main\s+Street',
+                r'supplier[:\s]*([A-Za-zÀ-ÿ\s]+?)(?=\s*Main\s*Street)',
+                r'supplier[:\s]*([A-Za-zÀ-ÿ\s]+?)(?=\s*Customer)',
+                r'supplier[:\s]*([^\s]+(?:\s+[^\s]+)*?)(?=\s*Main\s*Street)',
+            ]
+            
+            for i, pattern in enumerate(supplier_patterns):
+                print(f"[DEBUG] Trying supplier pattern {i+1}: {pattern}")
+                match = re.search(pattern, text, re.IGNORECASE)
+                if match:
+                    supplier_name = match.group(1).strip()
+                    print(f"[DEBUG] Supplier pattern {i+1} matched: '{supplier_name}'")
+                    if len(supplier_name) > 2:
+                        data['supplier_name'] = supplier_name
+                        break
+                else:
+                    print(f"[DEBUG] Supplier pattern {i+1} did not match")
+            
+            print(f"[DEBUG] Final supplier extraction: '{data['supplier_name']}'")
+            
+            # Extract customer name - with debug output
+            print(f"[DEBUG] Looking for customer in text")
+            
+            # Try multiple patterns
+            customer_patterns = [
+                r'customer[:\s]*([A-Za-zÀ-ÿ\s]+?)\s+Innovation\s+Avenue',
+                r'customer[:\s]*([A-Za-zÀ-ÿ\s]+?)(?=\s*Innovation\s*Avenue)',
+                r'customer[:\s]*([A-Za-zÀ-ÿ\s]+?)(?=\s*Items)',
+                r'customer[:\s]*([^\s]+(?:\s+[^\s]+)*?)(?=\s*Innovation\s*Avenue)',
+            ]
+            
+            for i, pattern in enumerate(customer_patterns):
+                print(f"[DEBUG] Trying customer pattern {i+1}: {pattern}")
+                match = re.search(pattern, text, re.IGNORECASE)
+                if match:
+                    customer_name = match.group(1).strip()
+                    print(f"[DEBUG] Customer pattern {i+1} matched: '{customer_name}'")
+                    customer_name = re.sub(r'\s+', ' ', customer_name)
+                    if len(customer_name) > 2:
+                        data['customer_name'] = customer_name
+                        break
+                else:
+                    print(f"[DEBUG] Customer pattern {i+1} did not match")
+            
+            print(f"[DEBUG] Final customer extraction: '{data['customer_name']}'")
             return data
 
         # 5) Extract invoice data
