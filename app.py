@@ -56,6 +56,12 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-haiku-20240307")
+# Additional AI tuning (timeouts and caps)
+OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "180"))
+OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
+OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "800"))
+SYNTHESIS_PER_FILE_MAX = int(os.getenv("SYNTHESIS_PER_FILE_MAX", "1200"))
+SYNTHESIS_MAX_CHARS = int(os.getenv("SYNTHESIS_MAX_CHARS", "8000"))
 
 # Print configuration at startup for debugging
 print("=== AI SERVICE CONFIGURATION ===")
@@ -240,14 +246,15 @@ def call_ollama(prompt, system_prompt=""):
             "options": {
                 "temperature": 0.7,  # Increased for more variation
                 "top_p": 0.9,
-                "num_ctx": 4096,
+                "num_ctx": OLLAMA_NUM_CTX,
+                "num_predict": OLLAMA_NUM_PREDICT,
                 "repeat_penalty": 1.1,
                 "seed": -1  # Random seed to prevent caching
             }
         }
         
         print(f"DEBUG: Calling Ollama with payload: {json.dumps(payload, indent=2)}")
-        response = requests.post(url, json=payload, timeout=60)
+        response = requests.post(url, json=payload, timeout=OLLAMA_TIMEOUT)
         if response.status_code == 200:
             result = response.json()
             response_text = result.get('response', 'No response from AI model')
@@ -2130,6 +2137,212 @@ RETURN JSON with fields: summary, key_topics (array), main_points (array), recom
         
     except Exception as e:
         return jsonify({"error": f"AI Summarization failed: {str(e)}"}), 500
+
+@app.post("/api/ai-document-synthesis")
+def ai_document_synthesis():
+    """Synthesize multiple PDFs into a single consolidated PDF (Report, Brief, or Minutes).
+    - Accepts multiple files under field name "files"
+    - Accepts form field "format" in {report|brief|minutes}
+    - Uses the configured AI service (same as Chat with PDF) to generate synthesized text
+    - Renders the synthesized text into a PDF and returns it
+    """
+    try:
+        files = request.files.getlist("files")
+        if not files:
+            return jsonify({"error": "Upload at least one PDF file"}), 400
+        if any(not allowed_pdf(f) for f in files):
+            return jsonify({"error": "Only PDF files are allowed"}), 400
+
+        target_format = (request.form.get("format") or "report").lower().strip()
+        if target_format not in ("report", "brief", "minutes"):
+            return jsonify({"error": "format must be one of: report|brief|minutes"}), 400
+
+        # Extract text from each PDF (truncate to keep prompt size manageable)
+        combined_snippets = []
+        total_pages = 0
+        current_total_chars = 0
+        for f in files:
+            # Stop early if we have reached the global cap
+            if current_total_chars >= SYNTHESIS_MAX_CHARS:
+                break
+            try:
+                reader = PdfReader(f)
+                doc_text = ""
+                for p in reader.pages:
+                    total_pages += 1
+                    txt = p.extract_text() or ""
+                    if txt:
+                        doc_text += txt + "\n"
+                # keep a capped snippet per file and a global cap
+                snippet = (doc_text or "").strip()
+                if snippet:
+                    snippet = snippet[:SYNTHESIS_PER_FILE_MAX]
+                    # Enforce global cap across all snippets
+                    remaining = max(SYNTHESIS_MAX_CHARS - current_total_chars, 0)
+                    if remaining > 0:
+                        snippet = snippet[:remaining]
+                        if snippet:
+                            combined_snippets.append(snippet)
+                            current_total_chars += len(snippet)
+                else:
+                    combined_snippets.append(f"[Unreadable or no text extracted from {secure_filename(f.filename)}]")
+            except Exception as e:
+                # Skip unreadable PDFs but continue
+                combined_snippets.append(f"[Unreadable or no text extracted from {secure_filename(f.filename)}]")
+
+        if not combined_snippets:
+            combined_snippets.append("[No text extracted from any input documents]")
+
+        # Build prompt for the AI model
+        system_map = {
+            "report": "Produce a well-structured professional report with sections (Overview, Key Findings, Analysis, Recommendations).",
+            "brief": "Produce an executive brief with bullets, focusing on clarity and concision.",
+            "minutes": "Produce meeting minutes with attendees (if inferable), agenda, decisions, action items, and next steps."
+        }
+        system_instruction = system_map.get(target_format, system_map["report"])  # default to report
+
+        prompt = (
+            f"SYSTEM: You synthesize multiple documents. Return a cohesive {target_format} in well-formatted paragraphs and bullet points where appropriate.\n"
+            f"Use clear headings (no markdown asterisks). Prefer headings that end with a colon.\n"
+            f"When listing, put each item on its own new line starting with '-' (dash). Avoid using '*' or '**'.\n\n"
+            f"DOCUMENT COUNT: {len(files)}, TOTAL PAGES (approx): {total_pages}\n"
+            f"FORMAT STYLE: {system_instruction}\n\n"
+            f"CONTENT SNIPPETS (truncated):\n"
+            + "\n\n---\n\n".join(combined_snippets)
+        )
+
+        # Call the same AI service as chat with PDF
+        ai_text = call_ai_service(prompt)
+        if not isinstance(ai_text, str):
+            ai_text = str(ai_text)
+        if not ai_text.strip():
+            ai_text = "No synthesized content produced by AI."
+
+        # Render the AI text into a simple PDF using reportlab
+        try:
+            from reportlab.lib.pagesizes import LETTER
+            from reportlab.lib.styles import getSampleStyleSheet
+            from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+            from reportlab.lib.units import inch
+            from reportlab.lib.styles import ParagraphStyle
+        except Exception as e:
+            return jsonify({"error": f"ReportLab not installed: {e}. Please add reportlab to requirements."}), 500
+
+        out_path = os.path.join(app.config["UPLOAD_FOLDER"], f"synthesis_{uuid.uuid4()}.pdf")
+        doc = SimpleDocTemplate(out_path, pagesize=LETTER, leftMargin=0.8*inch, rightMargin=0.8*inch, topMargin=0.8*inch, bottomMargin=0.8*inch)
+        story = []
+
+        styles = getSampleStyleSheet()
+        header_style = ParagraphStyle('Header', parent=styles['Heading1'], spaceAfter=12)
+        h2_style = ParagraphStyle('H2', parent=styles['Heading2'], spaceBefore=8, spaceAfter=6)
+        h3_style = ParagraphStyle('H3', parent=styles['Heading3'], spaceBefore=6, spaceAfter=4)
+        body_style = ParagraphStyle('Body', parent=styles['BodyText'], leading=14, spaceAfter=8, fontSize=11)
+        bullet1_style = ParagraphStyle('BulletL1', parent=styles['BodyText'], leftIndent=18, spaceBefore=2)
+        bullet2_style = ParagraphStyle('BulletL2', parent=styles['BodyText'], leftIndent=36, spaceBefore=2)
+        bullet3_style = ParagraphStyle('BulletL3', parent=styles['BodyText'], leftIndent=54, spaceBefore=2)
+
+        title_map = {"report": "SYNTHESIZED REPORT", "brief": "SYNTHESIZED BRIEF", "minutes": "SYNTHESIZED MINUTES"}
+        story.append(Paragraph(title_map.get(target_format, "SYNTHESIZED REPORT"), header_style))
+        story.append(Spacer(1, 0.2*inch))
+
+        # Parse AI text into headings, paragraphs, and bullets with up to 3 levels
+        import re
+        def esc(s: str) -> str:
+            return s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
+        # Clean markdown bold and normalize bullet separators that were crammed into one line
+        text = ai_text.replace('\r\n', '\n')
+        text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
+        text = re.sub(r'(?<=[\n\.;:])\s*(?:\*|\-|\+)\s+', '\n* ', text)
+
+        # Heading detectors
+        def is_h2(line: str) -> bool:
+            l = line.strip()
+            if len(l) < 2 or len(l) > 80:
+                return False
+            if l.endswith(':'):
+                return True
+            # ALL CAPS words
+            return bool(re.match(r'^[A-Z0-9][A-Z0-9\s\-/()&]{2,80}$', l))
+
+        def is_h3(line: str) -> bool:
+            l = line.strip()
+            if len(l) < 2 or len(l) > 80:
+                return False
+            if is_h2(l):
+                return False
+            # Title Case (allow small connector words)
+            return bool(re.match(r'^(?:[A-Z][\w()\-/]*)(?:\s+(?:[A-Z][\w()\-/]*|of|and|to|for|in|on|with|the|a|an))*$', l))
+
+        bullet_re = re.compile(r'^(?P<indent>\s*)(?:(?:[\*\-\+])|(?:\d+\.))\s+(?P<text>.+)$')
+
+        lines = text.split('\n')
+        paragraph_buf = []
+
+        def flush_paragraph():
+            if paragraph_buf:
+                paragraph_text = ' '.join(paragraph_buf).strip()
+                if paragraph_text:
+                    story.append(Paragraph(esc(paragraph_text), body_style))
+                paragraph_buf.clear()
+
+        for raw in lines:
+            line = raw.rstrip()
+            stripped = line.strip()
+            if not stripped:
+                flush_paragraph()
+                continue
+
+            # Bulleted item
+            m = bullet_re.match(line)
+            if m:
+                flush_paragraph()
+                indent = m.group('indent') or ''
+                level = 1 + min(2, len(indent) // 2)
+                txt = m.group('text').strip()
+                bullet_text = f"• {txt}"
+                style = bullet1_style if level == 1 else (bullet2_style if level == 2 else bullet3_style)
+                story.append(Paragraph(esc(bullet_text), style))
+                continue
+
+            # Headings
+            if is_h2(stripped):
+                flush_paragraph()
+                heading = stripped[:-1].strip() if stripped.endswith(':') else stripped
+                story.append(Paragraph(esc(heading), h2_style))
+                continue
+            if is_h3(stripped):
+                flush_paragraph()
+                story.append(Paragraph(esc(stripped), h3_style))
+                continue
+
+            # Regular paragraph line (will be joined until blank line)
+            paragraph_buf.append(stripped)
+
+        flush_paragraph()
+
+        try:
+            doc.build(story)
+        except Exception as e:
+            return jsonify({"error": f"Failed to render PDF: {e}"}), 500
+
+        @after_this_request
+        def _cleanup(resp):
+            try:
+                os.remove(out_path)
+            except OSError:
+                pass
+            return resp
+
+        return send_file(
+            out_path,
+            as_attachment=True,
+            download_name=f"document_{target_format}.pdf",
+            mimetype="application/pdf"
+        )
+
+    except Exception as e:
+        return jsonify({"error": f"Synthesis failed: {str(e)}"}), 500
 
 # ─────────────────────────────────────────────────────────────────
 
