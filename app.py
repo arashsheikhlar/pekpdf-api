@@ -303,6 +303,100 @@ def parse_json_safely(text):
 
     raise ValueError("Could not parse JSON from response")
 
+# --- AI output normalization helpers ---
+
+def _strip_code_fences(s):
+    if not isinstance(s, str):
+        return s
+    t = s.strip()
+    if t.startswith("```") and t.endswith("```"):
+        t = t.strip('`')
+        t = t.replace('json', '', 1).strip()
+    return t
+
+def _object_to_readable(obj: dict) -> str:
+    if not isinstance(obj, dict):
+        return str(obj)
+    # Prefer common keys in a human order
+    parts = []
+    for key in ["title", "name", "point", "summary", "rationale", "recommendation", "action", "explanation", "detail", "note"]:
+        if key in obj and obj.get(key):
+            parts.append(f"{key.capitalize()}: {obj.get(key)}")
+    if parts:
+        return " ".join(parts)
+    # Fallback: join all key/values
+    try:
+        return "; ".join([f"{k.capitalize()}: {v}" for k, v in obj.items() if v is not None])
+    except Exception:
+        return str(obj)
+
+def _clean_display_text(text: str) -> str:
+    if text is None:
+        return ""
+    if not isinstance(text, str):
+        return str(text)
+    import re, json as _json
+    s = _strip_code_fences(text)
+    s = s.strip()
+    # Full-string JSON object → readable
+    if s.startswith('{') and s.endswith('}'):
+        try:
+            return _object_to_readable(_json.loads(s))
+        except Exception:
+            pass
+    # Replace embedded JSON objects that contain rationale/recommendation with readable form
+    def _repl(m):
+        chunk = m.group(0)
+        try:
+            return _object_to_readable(_json.loads(chunk))
+        except Exception:
+            return ''
+    s = re.sub(r"\{[^{}]*?(?:\"rationale\"|\"recommendation\")[^{}]*?\}", _repl, s)
+    # Strip stray outer quotes
+    if s.startswith('"') and s.endswith('"'):
+        s = s[1:-1]
+    # Normalize whitespace
+    s = " ".join(s.split())
+    return s
+
+def _normalize_list(value):
+    import re
+    items = []
+    if isinstance(value, list):
+        items = value
+    elif isinstance(value, str):
+        items = [p.strip(' -*•') for p in re.split(r"[\r\n]+", value) if p.strip()]
+    else:
+        return []
+    normalized = []
+    for it in items:
+        if isinstance(it, dict):
+            normalized.append(_object_to_readable(it))
+        elif isinstance(it, str):
+            # Try parsing JSON-ish string
+            try:
+                obj = parse_json_safely(it)
+                if isinstance(obj, dict):
+                    normalized.append(_object_to_readable(obj))
+                    continue
+            except Exception:
+                pass
+            normalized.append(_clean_display_text(it))
+        else:
+            normalized.append(str(it))
+    return normalized
+
+def normalize_ai_summary_payload(payload):
+    """Normalize/clean AI JSON payload so UI never shows raw JSON fragments."""
+    if not isinstance(payload, dict):
+        return {"summary": _clean_display_text(str(payload)), "key_topics": [], "main_points": [], "recommendations": []}
+    res = {}
+    res["summary"] = _clean_display_text(payload.get("summary") or payload.get("overview") or payload.get("executive_summary") or payload.get("message") or "")
+    res["key_topics"] = _normalize_list(payload.get("key_topics") or payload.get("topics") or payload.get("key_points") or payload.get("bullets") or payload.get("highlights"))
+    res["main_points"] = _normalize_list(payload.get("main_points") or payload.get("points") or payload.get("findings") or payload.get("takeaways"))
+    res["recommendations"] = _normalize_list(payload.get("recommendations") or payload.get("suggestions") or payload.get("actions") or payload.get("next_steps"))
+    return res
+
 app = Flask(__name__)
 app.config["UPLOAD_FOLDER"] = "temp"
 os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
@@ -1992,7 +2086,7 @@ RETURN JSON with fields: summary, key_topics (array), main_points (array), recom
         
         try:
             # Try to parse the response as JSON
-            ai_explanation = parse_json_safely(ai_response_text)
+            ai_explanation = normalize_ai_summary_payload(parse_json_safely(ai_response_text))
         except Exception:
             # Fallback to structured response if JSON parsing fails
             ai_explanation = {
@@ -2056,7 +2150,7 @@ RETURN JSON with fields: question, answer, confidence, suggested_followup (array
         
         try:
             # Try to parse the response as JSON
-            ai_answer = parse_json_safely(ai_response_text)
+            ai_answer = normalize_ai_summary_payload(parse_json_safely(ai_response_text))
         except Exception:
             # Fallback to structured response if JSON parsing fails
             ai_answer = {
@@ -2111,7 +2205,7 @@ RETURN JSON with fields: summary, key_topics (array), main_points (array), recom
         
         try:
             # Try to parse the response as JSON
-            ai_summary = parse_json_safely(ai_response_text)
+            ai_summary = normalize_ai_summary_payload(parse_json_safely(ai_response_text))
         except Exception:
             # Fallback to structured response if JSON parsing fails
             ai_summary = {
