@@ -18,7 +18,7 @@ from flask_cors import CORS                 # allow front-end origin
 from werkzeug.utils import secure_filename
 from PyPDF2 import PdfMerger, PdfReader, PdfWriter   # ← PdfReader/Writer for split
 from datetime import datetime, timedelta
-import mimetypes, os, uuid, io
+import mimetypes, os, uuid, io, re
 import subprocess, shlex          # run Ghostscript
 import shutil, platform
 from pdf2docx import Converter
@@ -28,6 +28,13 @@ from pdfminer.high_level import extract_text_to_fp
 from pdfminer.layout import LAParams
 import pdfplumber
 import sys
+import threading
+import hashlib
+import time
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, ListFlowable, ListItem
+from reportlab.lib import colors
 
 # Try to import pandas, but make it optional
 try:
@@ -45,6 +52,11 @@ from dotenv import load_dotenv
 import requests
 import json
 
+try:
+    from extraction.ocr_service import OCRService
+except Exception:
+    OCRService = None  # type: ignore
+
 # Load environment variables from .env file
 load_dotenv()
 
@@ -58,8 +70,8 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-haiku-20240307")
 # Additional AI tuning (timeouts and caps)
 OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "180"))
-OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
-OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "800"))
+OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "16384"))
+OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "4096"))
 SYNTHESIS_PER_FILE_MAX = int(os.getenv("SYNTHESIS_PER_FILE_MAX", "1200"))
 SYNTHESIS_MAX_CHARS = int(os.getenv("SYNTHESIS_MAX_CHARS", "8000"))
 
@@ -91,6 +103,155 @@ VALID_ANTHROPIC_MODELS = [
     "claude-3-5-haiku",
     "claude-3-5-opus"
 ]
+
+# Simple in-memory job store for async extract (MVP; not for multi-process)
+EXTRACT_JOBS = {}
+EXTRACT_JOBS_LOCK = threading.Lock()
+
+# Simple in-memory cache (process-local)
+EXTRACT_CACHE: dict[str, dict] = {}
+
+# Disk cache for extract results (per-process simple cache)
+EXTRACT_CACHE_TTL_SECONDS = int(os.getenv("EXTRACT_CACHE_TTL_SECONDS", "86400"))  # 1 day default
+EXTRACT_PIPELINE_VERSION = "v3-ai-only"  # bump to invalidate old cache for AI-only pipeline
+
+_OCR_SERVICE = OCRService() if OCRService is not None else None
+
+def build_inverted_index(pages_text: list[str]) -> dict[str, list[int]]:
+    """Very simple inverted index: word (>=4 chars) -> sorted list of page numbers (1-indexed)."""
+    index: dict[str, set[int]] = {}
+    try:
+        for i, txt in enumerate(pages_text or []):
+            if not txt:
+                continue
+            for w in re.findall(r"[A-Za-z][A-Za-z0-9\-]{3,}", txt.lower()):
+                s = index.get(w)
+                if s is None:
+                    s = set()
+                    index[w] = s
+                s.add(i + 1)
+        return {k: sorted(list(v)) for k, v in index.items()}
+    except Exception:
+        return {}
+
+def enrich_extraction_with_llm(dtype: str, mapped: dict, full_text: str, pages_text: list[str] | None = None, inv_index: dict[str, list[int]] | None = None) -> dict:
+    """Optional hybrid LLM enrichment for complex fields. Returns envelope with 'mapped_fields'."""
+    try:
+        if not isinstance(mapped, dict) or not full_text:
+            return {"mapped_fields": mapped}
+        domain = (dtype or 'general').lower()
+        # Build RAG snippets: pick candidate pages based on tokens from mapped fields
+        rag_pages: list[int] = []
+        try:
+            candidates: dict[int, int] = {}
+            tokens: list[str] = []
+            if domain == 'healthcare':
+                # Prefer diagnosis_text, plan, medication names, labs names
+                if isinstance(mapped.get('diagnosis_text'), str):
+                    tokens += re.findall(r"[A-Za-z][A-Za-z0-9\-]{4,}", mapped['diagnosis_text'])
+                if isinstance(mapped.get('plan'), str):
+                    tokens += re.findall(r"[A-Za-z][A-Za-z0-9\-]{4,}", mapped['plan'])
+                for m in (mapped.get('medications') or []):
+                    try:
+                        nm = (m or {}).get('name')
+                        if isinstance(nm, str):
+                            tokens += re.findall(r"[A-Za-z][A-Za-z0-9\-]{4,}", nm)
+                    except Exception:
+                        pass
+                for l in (mapped.get('labs') or []):
+                    try:
+                        nm = (l or {}).get('name')
+                        if isinstance(nm, str):
+                            tokens += re.findall(r"[A-Za-z][A-Za-z0-9\-]{4,}", nm)
+                    except Exception:
+                        pass
+            elif domain == 'contract':
+                for k in ('party_a','party_b','governing_law','term'):
+                    if isinstance(mapped.get(k), str):
+                        tokens += re.findall(r"[A-Za-z][A-Za-z0-9\-]{4,}", mapped[k])
+            elif domain == 'research':
+                for k in ('abstract','methodology','results','conclusions'):
+                    if isinstance(mapped.get(k), str):
+                        tokens += re.findall(r"[A-Za-z][A-Za-z0-9\-]{4,}", mapped[k])
+            # Use inverted index to find candidate pages
+            if inv_index:
+                for t in tokens[:20]:
+                    for p in inv_index.get(t.lower(), []) or []:
+                        candidates[p] = candidates.get(p, 0) + 1
+            # Choose top pages by score
+            rag_pages = [p for p, _ in sorted(candidates.items(), key=lambda kv: (-kv[1], kv[0]))[:3]]
+        except Exception:
+            rag_pages = []
+
+        rag_snippets = []
+        try:
+            if pages_text and rag_pages:
+                for p in rag_pages:
+                    if 1 <= p <= len(pages_text):
+                        snippet = (pages_text[p-1] or '')
+                        if snippet:
+                            rag_snippets.append(f"[Page {p}] " + snippet[:800])
+        except Exception:
+            pass
+
+        rag_block = ("\nRAG_SNIPPETS:\n" + "\n\n".join(rag_snippets)) if rag_snippets else ""
+        prompt = (
+            f"SYSTEM: You are a domain-specific extraction validator and enricher for {domain} documents.\n"
+            "Return ONLY a JSON object with normalized structures.\n\n"
+            "INPUT (truncated to 8000 chars):\n" + full_text[:8000] + "\n\n"
+            + rag_block + "\n\n"
+            "TASK:\n"
+            "- Normalize and enrich extracted fields if possible.\n"
+            "- For healthcare: infer diagnoses (array of strings), procedures (array), and normalize labs as {name,value,unit,flag}.\n"
+            "- For contracts: extract obligations (array), termination_conditions (array).\n"
+            "- For research: extract key_findings (array) and primary_outcomes (array).\n\n"
+            "OUTPUT (strict JSON): {\n"
+            "  \"diagnoses\": [], \"procedures\": [], \"labs_normalized\": [], \"obligations\": [], \"termination_conditions\": [], \"key_findings\": [], \"primary_outcomes\": []\n"
+            "}"
+        )
+        ai_text = call_ai_service(prompt)
+        data = {}
+        try:
+            data = parse_json_safely(ai_text)
+        except Exception:
+            return {"mapped_fields": mapped}
+        if not isinstance(data, dict):
+            return {"mapped_fields": mapped}
+        out = dict(mapped)
+        # Merge selected fields under enrichment namespace too
+        enrichment = {}
+        for k in ("diagnoses","procedures","labs_normalized","obligations","termination_conditions","key_findings","primary_outcomes"):
+            if k in data and data.get(k) is not None:
+                enrichment[k] = data.get(k)
+        if enrichment:
+            out["enriched"] = True
+            out["enrichment"] = enrichment
+            try:
+                print(f"DEBUG: Enrichment produced keys: {list(enrichment.keys())}")
+                sys.stdout.flush()
+            except Exception:
+                pass
+        else:
+            try:
+                print("DEBUG: Enrichment found no additional data")
+                sys.stdout.flush()
+            except Exception:
+                pass
+        return {"mapped_fields": out}
+    except Exception:
+        return {"mapped_fields": mapped}
+
+def _extract_cache_dir() -> str:
+    try:
+        base = app.config.get("UPLOAD_FOLDER") or os.path.join(os.getcwd(), "uploads")
+        path = os.path.join(base, "extract_cache")
+        os.makedirs(path, exist_ok=True)
+        return path
+    except Exception:
+        return os.getcwd()
+
+def _extract_cache_path(key: str) -> str:
+    return os.path.join(_extract_cache_dir(), f"{key}.json")
 
 def call_ai_service(prompt, system_prompt=""):
     """Call AI service (Ollama, OpenAI, or Anthropic) based on configuration"""
@@ -244,12 +405,13 @@ def call_ollama(prompt, system_prompt=""):
             "system": system_prompt,
             "stream": False,
             "options": {
-                "temperature": 0.7,  # Increased for more variation
-                "top_p": 0.9,
+                "temperature": 0.3,
+                "top_p": 0.8,
                 "num_ctx": OLLAMA_NUM_CTX,
                 "num_predict": OLLAMA_NUM_PREDICT,
                 "repeat_penalty": 1.1,
-                "seed": -1  # Random seed to prevent caching
+                "seed": -1,
+                "stop": ["```", "\n\n\n"]
             }
         }
         
@@ -395,6 +557,36 @@ def normalize_ai_summary_payload(payload):
     res["key_topics"] = _normalize_list(payload.get("key_topics") or payload.get("topics") or payload.get("key_points") or payload.get("bullets") or payload.get("highlights"))
     res["main_points"] = _normalize_list(payload.get("main_points") or payload.get("points") or payload.get("findings") or payload.get("takeaways"))
     res["recommendations"] = _normalize_list(payload.get("recommendations") or payload.get("suggestions") or payload.get("actions") or payload.get("next_steps"))
+    return res
+
+def normalize_ai_explain_payload(payload):
+    """Normalize/clean AI JSON payload for Explain mode (educational output)."""
+    if not isinstance(payload, dict):
+        return {
+            "summary": _clean_display_text(str(payload)),
+            "key_concepts": [],
+            "explanations": [],
+            "context": [],
+            "definitions": []
+        }
+    res = {}
+    res["summary"] = _clean_display_text(
+        payload.get("explanation_summary")
+        or payload.get("summary")
+        or payload.get("overview")
+        or payload.get("message")
+        or ""
+    )
+    # Arrays, accepting multiple common aliases
+    def L(key_candidates):
+        for k in key_candidates:
+            if k in payload and payload.get(k):
+                return _normalize_list(payload.get(k))
+        return []
+    res["key_concepts"] = L(["key_concepts", "concepts", "key_terms", "terms", "ideas"])
+    res["explanations"] = L(["explanations", "how_it_works", "analysis", "details", "rationale"])
+    res["context"] = L(["context", "background", "related_work", "history"])
+    res["definitions"] = L(["definitions", "glossary", "term_definitions", "terminology"]) 
     return res
 
 app = Flask(__name__)
@@ -2070,37 +2262,91 @@ def ai_explain_pdf():
         for page in pdf_reader.pages:
             text_content += page.extract_text() + "\n"
         
-        # Create prompt for Ollama
-        prompt = f"""SYSTEM: You are an AI expert at analyzing and explaining documents. Always respond with valid JSON.
----
-PDF PAGES: {len(pdf_reader.pages)}
-CONTENT (truncated to 1500 chars):
-{text_content[:1500]}
----
-TASK: Explain the document.
-RETURN JSON with fields: summary, key_topics (array), main_points (array), recommendations (array)
+        # Read domain/detail preferences
+        domain = (request.form.get("domain") or "general").lower().strip()
+        detail = (request.form.get("detail") or "basic").lower().strip()  # basic | advanced
+        
+        domain_instructions = {
+            "legal": (
+                "Explain legal concepts, procedural posture, applicable statutes/regulations/case law, and how arguments relate to holdings. "
+                "Define terms (e.g., summary judgment, burden of proof) with concise examples."
+            ),
+            "finance": (
+                "Explain financial metrics, ratios, and statements (income, balance, cash flow). "
+                "Define KPIs and clarify how they are computed and interpreted (e.g., EBITDA, gross margin)."
+            ),
+            "research": (
+                "Explain research methods, hypotheses, datasets, and statistical results. "
+                "Clarify concepts like significance, confidence intervals, bias, and limitations."
+            ),
+            "healthcare": (
+                "Explain clinical terms, diagnostics, interventions, and outcome measures. "
+                "Clarify protocols and safety considerations in patient care contexts."
+            ),
+            "general": (
+                "Explain key ideas, define important terms, and provide background context for understanding."
+            ),
+        }
+        selected_domain_instructions = domain_instructions.get(domain, domain_instructions["general"])
+        
+        if detail == "advanced":
+            detail_instructions = (
+                "Provide advanced explanations with concise math/logic where appropriate, step-by-step breakdowns, and examples."
+            )
+        else:
+            detail_instructions = (
+                "Provide basic explanations aimed at a non-expert audience, using simple language and short examples."
+            )
+        
+        # Create improved prompt for Explain mode
+        prompt = f"""SYSTEM: You are an expert {domain} explainer. Always respond with a single valid JSON object only (no markdown, no code fences).
+
+INPUT:
+- PDF pages: {len(pdf_reader.pages)}
+- Content (truncated to 8000 chars):
+{text_content[:8000]}
+
+TASK:
+- Explain the document for the {domain} domain.
+- {selected_domain_instructions}
+- {detail_instructions}
+
+OUTPUT FORMAT (strict):
+Return ONLY a JSON object with the following fields:
+- summary: string
+- key_concepts: array of strings
+- explanations: array of strings
+- context: array of strings
+- definitions: array of strings
+
+STRICT RULES:
+- Do not wrap the JSON in triple backticks.
+- Do not include nested JSON objects inside strings. Write plain readable sentences.
 """
         
-        # Call Ollama
+        # Call AI service
         ai_response_text = call_ai_service(prompt)
         
         try:
             # Try to parse the response as JSON
-            ai_explanation = normalize_ai_summary_payload(parse_json_safely(ai_response_text))
+            ai_explanation = normalize_ai_explain_payload(parse_json_safely(ai_response_text))
         except Exception:
             # Fallback to structured response if JSON parsing fails
             ai_explanation = {
                 "summary": f"This document contains {len(pdf_reader.pages)} pages of content.",
-                "key_topics": ["Document Analysis", "Content Understanding", "PDF Processing"],
-                "main_points": [
-                    "The document appears to be well-structured",
-                    "Contains multiple pages of information",
-                    "Suitable for AI-powered analysis and explanation"
+                "key_concepts": ["Core ideas", "Important terms", "Foundational concepts"],
+                "explanations": [
+                    "High-level explanation of how the main process works",
+                    "Step-by-step outline of a central concept",
+                    "Clarification of why certain results matter"
                 ],
-                "recommendations": [
-                    "Consider using specific questions to get targeted insights",
-                    "The content is ready for detailed analysis",
-                    "AI can provide deeper understanding of specific sections"
+                "context": [
+                    "Background or related frameworks",
+                    "Assumptions or prerequisites",
+                    "Limitations noted in the document"
+                ],
+                "definitions": [
+                    "Define key terms in concise, plain language"
                 ]
             }
         
@@ -2189,18 +2435,80 @@ def ai_summarize_pdf():
         for page in pdf_reader.pages:
             text_content += page.extract_text() + "\n"
         
-        # Create prompt for Ollama
-        prompt = f"""SYSTEM: You are an AI expert at summarizing documents. Always respond with valid JSON.
----
-PDF PAGES: {len(pdf_reader.pages)}
-CONTENT (truncated to 1500 chars):
-{text_content[:1500]}
----
-TASK: Provide a comprehensive summary.
-RETURN JSON with fields: summary, key_topics (array), main_points (array), recommendations (array)
+        # Read domain/detail/provenance preferences from request
+        domain = (request.form.get("domain") or "general").lower().strip()
+        detail = (request.form.get("detail") or "executive").lower().strip()
+        provenance_flag = (request.form.get("provenance") or "false").lower().strip() in ("1", "true", "yes", "on")
+        
+        # Domain-specific guidance
+        domain_instructions = {
+            "legal": (
+                "Focus on parties, legal issues, causes of action, procedural posture, applicable statutes/regulations/case law, key arguments, holdings, and compliance implications. "
+                "Highlight deadlines, obligations, and risk exposure. Use precise legal terminology."
+            ),
+            "finance": (
+                "Focus on financial performance, KPIs, ratios (e.g., revenue growth, EBITDA, margins), cash flow, balance sheet health, forecasts, risks/opportunities, and regulatory disclosures. "
+                "Summarize material changes, market conditions, and strategic recommendations."
+            ),
+            "research": (
+                "Focus on research questions, hypotheses, methodology, datasets, key findings, statistical significance, limitations, and implications. "
+                "Note related work context and future research directions."
+            ),
+            "healthcare": (
+                "Focus on patient population, conditions, diagnostics, interventions, outcomes, safety considerations, and protocols. "
+                "Capture clinical recommendations, contraindications, and regulatory or compliance notes."
+            ),
+            "general": (
+                "Provide a clear and concise summary of the document's purpose, structure, main ideas, and actionable recommendations."
+            ),
+        }
+        selected_domain_instructions = domain_instructions.get(domain, domain_instructions["general"])
+        
+        # Detail-level guidance
+        if detail == "deep":
+            detail_instructions = (
+                "Produce a section-by-section outline. Use clear section headers and concise bullet points for subpoints. "
+                "Aim for 7-12 main outline bullets overall."
+            )
+        else:
+            detail_instructions = (
+                "Produce an executive summary with 5 high-impact bullets. Keep it concise and outcome-oriented."
+            )
+        
+        # Provenance guidance
+        provenance_instructions = (
+            "For each bullet, include a short verbatim anchor phrase from the document in quotes to aid provenance mapping. "
+            "Keep quotes brief (3-10 words)."
+        ) if provenance_flag else "Use precise language grounded in the document; avoid speculation."
+        
+        # Create improved prompt
+        prompt = f"""SYSTEM: You are an expert {domain} document summarizer. Always respond with a single valid JSON object only (no markdown, no code fences).
+
+INPUT:
+- PDF pages: {len(pdf_reader.pages)}
+- Content (truncated to 8000 chars):
+{text_content[:8000]}
+
+TASK:
+- Summarize the document for the {domain} domain.
+- {selected_domain_instructions}
+- {detail_instructions}
+- {provenance_instructions}
+
+OUTPUT FORMAT (strict):
+Return ONLY a JSON object with the following fields:
+- summary: string
+- key_topics: array of strings
+- main_points: array of strings
+- recommendations: array of strings
+
+STRICT RULES:
+- Do not wrap the JSON in triple backticks.
+- Do not include nested JSON objects inside strings. Write plain readable sentences.
+- Use short verbatim quotes from the document within bullets when helpful for provenance.
 """
         
-        # Call Ollama
+        # Call AI service
         ai_response_text = call_ai_service(prompt)
         
         try:
@@ -2212,7 +2520,7 @@ RETURN JSON with fields: summary, key_topics (array), main_points (array), recom
                 "summary": f"This {len(pdf_reader.pages)}-page document contains comprehensive information that has been analyzed using AI technology.",
                 "key_topics": [
                     "Document Analysis",
-                    "Content Understanding", 
+                    "Content Understanding",
                     "PDF Processing"
                 ],
                 "main_points": [
@@ -2234,11 +2542,16 @@ RETURN JSON with fields: summary, key_topics (array), main_points (array), recom
 
 @app.post("/api/ai-document-synthesis")
 def ai_document_synthesis():
-    """Synthesize multiple PDFs into a single consolidated PDF (Report, Brief, or Minutes).
+    """Synthesize multiple PDFs into a single consolidated document.
     - Accepts multiple files under field name "files"
     - Accepts form field "format" in {report|brief|minutes}
-    - Uses the configured AI service (same as Chat with PDF) to generate synthesized text
-    - Renders the synthesized text into a PDF and returns it
+    - Optional form fields:
+      - domain_override: {general|legal|finance|research|healthcare}
+      - template_profile: {executive_summary|risk_assessment|compliance_review}
+      - custom_instructions: free text
+      - output_format: {pdf|docx|pptx|teams}
+    - Uses the configured AI service to generate synthesized text
+    - Renders the synthesized text into the requested output format
     """
     try:
         files = request.files.getlist("files")
@@ -2251,194 +2564,1348 @@ def ai_document_synthesis():
         if target_format not in ("report", "brief", "minutes"):
             return jsonify({"error": "format must be one of: report|brief|minutes"}), 400
 
-        # Extract text from each PDF (truncate to keep prompt size manageable)
-        combined_snippets = []
-        total_pages = 0
-        current_total_chars = 0
-        for f in files:
-            # Stop early if we have reached the global cap
-            if current_total_chars >= SYNTHESIS_MAX_CHARS:
-                break
+        # New optional controls
+        domain_override = (request.form.get("domain_override") or "").lower().strip() or None
+        if domain_override and domain_override not in ("general", "legal", "finance", "research", "healthcare"):
+            return jsonify({"error": "domain_override must be one of: general|legal|finance|research|healthcare"}), 400
+        template_profile = (request.form.get("template_profile") or "").lower().strip() or None
+        if template_profile and template_profile not in ("executive_summary", "risk_assessment", "compliance_review"):
+            return jsonify({"error": "template_profile must be one of: executive_summary|risk_assessment|compliance_review"}), 400
+        custom_instructions = (request.form.get("custom_instructions") or "").strip() or None
+        output_format = (request.form.get("output_format") or "pdf").lower().strip()
+        if output_format not in ("pdf", "docx", "pptx", "teams"):
+            return jsonify({"error": "output_format must be one of: pdf|docx|pptx|teams"}), 400
+
+        # Modular pipeline: analysis → prompt → AI
+        try:
+            from synthesis.pipeline import SynthesisOrchestrator
+        except Exception as e:
+            # Fallback: local import if package style differs
+            from backend.synthesis.pipeline import SynthesisOrchestrator  # type: ignore
+
+        orchestrator = SynthesisOrchestrator()
+        # Build AI router with primary configured service and simple fallbacks
+        from synthesis.ai_service import AIServiceRouter
+        callers = [(AI_SERVICE, lambda p: call_ai_service(p))]
+        # Optional: add local fallbacks if available
+        if AI_SERVICE != "openai" and OPENAI_API_KEY:
+            callers.append(("openai", lambda p: call_openai(p)))
+        if AI_SERVICE != "anthropic" and ANTHROPIC_API_KEY:
+            callers.append(("anthropic", lambda p: call_anthropic(p)))
+        router = AIServiceRouter(callers, min_len=80)
+
+        ai_text, artifacts = orchestrator.run(
+            files=files,
+            target_format=target_format,
+            per_file_max_chars=SYNTHESIS_PER_FILE_MAX,
+            global_max_chars=SYNTHESIS_MAX_CHARS,
+            ai_caller=lambda prompt: router.generate(prompt),
+            forced_domain=domain_override,
+            template_profile=template_profile,
+            user_instructions=custom_instructions,
+        )
+
+        # Render output according to requested format
+        if output_format == "pdf":
             try:
-                reader = PdfReader(f)
-                doc_text = ""
-                for p in reader.pages:
-                    total_pages += 1
-                    txt = p.extract_text() or ""
-                    if txt:
-                        doc_text += txt + "\n"
-                # keep a capped snippet per file and a global cap
-                snippet = (doc_text or "").strip()
-                if snippet:
-                    snippet = snippet[:SYNTHESIS_PER_FILE_MAX]
-                    # Enforce global cap across all snippets
-                    remaining = max(SYNTHESIS_MAX_CHARS - current_total_chars, 0)
-                    if remaining > 0:
-                        snippet = snippet[:remaining]
-                        if snippet:
-                            combined_snippets.append(snippet)
-                            current_total_chars += len(snippet)
-                else:
-                    combined_snippets.append(f"[Unreadable or no text extracted from {secure_filename(f.filename)}]")
+                from reportlab.lib.pagesizes import LETTER
+                from reportlab.lib.styles import getSampleStyleSheet
+                from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
+                from reportlab.lib.units import inch
+                from reportlab.lib.styles import ParagraphStyle
             except Exception as e:
-                # Skip unreadable PDFs but continue
-                combined_snippets.append(f"[Unreadable or no text extracted from {secure_filename(f.filename)}]")
+                return jsonify({"error": f"ReportLab not installed: {e}. Please add reportlab to requirements."}), 500
 
-        if not combined_snippets:
-            combined_snippets.append("[No text extracted from any input documents]")
+            out_path = os.path.join(app.config["UPLOAD_FOLDER"], f"synthesis_{uuid.uuid4()}.pdf")
+            doc = SimpleDocTemplate(out_path, pagesize=LETTER, leftMargin=0.8*inch, rightMargin=0.8*inch, topMargin=0.8*inch, bottomMargin=0.8*inch)
+            story = []
 
-        # Build prompt for the AI model
-        system_map = {
-            "report": "Produce a well-structured professional report with sections (Overview, Key Findings, Analysis, Recommendations).",
-            "brief": "Produce an executive brief with bullets, focusing on clarity and concision.",
-            "minutes": "Produce meeting minutes with attendees (if inferable), agenda, decisions, action items, and next steps."
-        }
-        system_instruction = system_map.get(target_format, system_map["report"])  # default to report
+            styles = getSampleStyleSheet()
+            header_style = ParagraphStyle('Header', parent=styles['Heading1'], spaceAfter=12)
+            h2_style = ParagraphStyle('H2', parent=styles['Heading2'], spaceBefore=8, spaceAfter=6)
+            h3_style = ParagraphStyle('H3', parent=styles['Heading3'], spaceBefore=6, spaceAfter=4)
+            body_style = ParagraphStyle('Body', parent=styles['BodyText'], leading=14, spaceAfter=8, fontSize=11)
+            bullet1_style = ParagraphStyle('BulletL1', parent=styles['BodyText'], leftIndent=18, spaceBefore=2)
+            bullet2_style = ParagraphStyle('BulletL2', parent=styles['BodyText'], leftIndent=36, spaceBefore=2)
+            bullet3_style = ParagraphStyle('BulletL3', parent=styles['BodyText'], leftIndent=54, spaceBefore=2)
 
-        prompt = (
-            f"SYSTEM: You synthesize multiple documents. Return a cohesive {target_format} in well-formatted paragraphs and bullet points where appropriate.\n"
-            f"Use clear headings (no markdown asterisks). Prefer headings that end with a colon.\n"
-            f"When listing, put each item on its own new line starting with '-' (dash). Avoid using '*' or '**'.\n\n"
-            f"DOCUMENT COUNT: {len(files)}, TOTAL PAGES (approx): {total_pages}\n"
-            f"FORMAT STYLE: {system_instruction}\n\n"
-            f"CONTENT SNIPPETS (truncated):\n"
-            + "\n\n---\n\n".join(combined_snippets)
-        )
+            title_map = {"report": "SYNTHESIZED REPORT", "brief": "SYNTHESIZED BRIEF", "minutes": "SYNTHESIZED MINUTES"}
+            story.append(Paragraph(title_map.get(target_format, "SYNTHESIZED REPORT"), header_style))
+            story.append(Spacer(1, 0.2*inch))
 
-        # Call the same AI service as chat with PDF
-        ai_text = call_ai_service(prompt)
-        if not isinstance(ai_text, str):
-            ai_text = str(ai_text)
-        if not ai_text.strip():
-            ai_text = "No synthesized content produced by AI."
+            # Parse AI text into headings, paragraphs, and bullets with up to 3 levels
+            import re
+            def esc(s: str) -> str:
+                return s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
-        # Render the AI text into a simple PDF using reportlab
-        try:
-            from reportlab.lib.pagesizes import LETTER
-            from reportlab.lib.styles import getSampleStyleSheet
-            from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-            from reportlab.lib.units import inch
-            from reportlab.lib.styles import ParagraphStyle
-        except Exception as e:
-            return jsonify({"error": f"ReportLab not installed: {e}. Please add reportlab to requirements."}), 500
+            text = ai_text.replace('\r\n', '\n')
+            text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
+            text = re.sub(r'(?<=[\n\.;:])\s*(?:\*|\-|\+)\s+', '\n* ', text)
 
-        out_path = os.path.join(app.config["UPLOAD_FOLDER"], f"synthesis_{uuid.uuid4()}.pdf")
-        doc = SimpleDocTemplate(out_path, pagesize=LETTER, leftMargin=0.8*inch, rightMargin=0.8*inch, topMargin=0.8*inch, bottomMargin=0.8*inch)
-        story = []
+            def is_h2(line: str) -> bool:
+                l = line.strip()
+                if len(l) < 2 or len(l) > 80:
+                    return False
+                if l.endswith(':'):
+                    return True
+                return bool(re.match(r'^[A-Z0-9][A-Z0-9\s\-/()&]{2,80}$', l))
 
-        styles = getSampleStyleSheet()
-        header_style = ParagraphStyle('Header', parent=styles['Heading1'], spaceAfter=12)
-        h2_style = ParagraphStyle('H2', parent=styles['Heading2'], spaceBefore=8, spaceAfter=6)
-        h3_style = ParagraphStyle('H3', parent=styles['Heading3'], spaceBefore=6, spaceAfter=4)
-        body_style = ParagraphStyle('Body', parent=styles['BodyText'], leading=14, spaceAfter=8, fontSize=11)
-        bullet1_style = ParagraphStyle('BulletL1', parent=styles['BodyText'], leftIndent=18, spaceBefore=2)
-        bullet2_style = ParagraphStyle('BulletL2', parent=styles['BodyText'], leftIndent=36, spaceBefore=2)
-        bullet3_style = ParagraphStyle('BulletL3', parent=styles['BodyText'], leftIndent=54, spaceBefore=2)
+            def is_h3(line: str) -> bool:
+                l = line.strip()
+                if len(l) < 2 or len(l) > 80:
+                    return False
+                if is_h2(l):
+                    return False
+                return bool(re.match(r'^(?:[A-Z][\w()\-/]*)(?:\s+(?:[A-Z][\w()\-/]*|of|and|to|for|in|on|with|the|a|an))*$', l))
 
-        title_map = {"report": "SYNTHESIZED REPORT", "brief": "SYNTHESIZED BRIEF", "minutes": "SYNTHESIZED MINUTES"}
-        story.append(Paragraph(title_map.get(target_format, "SYNTHESIZED REPORT"), header_style))
-        story.append(Spacer(1, 0.2*inch))
+            bullet_re = re.compile(r'^(?P<indent>\s*)(?:(?:[\*\-\+])|(?:\d+\.))\s+(?P<text>.+)$')
 
-        # Parse AI text into headings, paragraphs, and bullets with up to 3 levels
-        import re
-        def esc(s: str) -> str:
-            return s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            lines = text.split('\n')
+            paragraph_buf = []
 
-        # Clean markdown bold and normalize bullet separators that were crammed into one line
-        text = ai_text.replace('\r\n', '\n')
-        text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
-        text = re.sub(r'(?<=[\n\.;:])\s*(?:\*|\-|\+)\s+', '\n* ', text)
+            def flush_paragraph():
+                if paragraph_buf:
+                    paragraph_text = ' '.join(paragraph_buf).strip()
+                    if paragraph_text:
+                        story.append(Paragraph(esc(paragraph_text), body_style))
+                    paragraph_buf.clear()
 
-        # Heading detectors
-        def is_h2(line: str) -> bool:
-            l = line.strip()
-            if len(l) < 2 or len(l) > 80:
-                return False
-            if l.endswith(':'):
-                return True
-            # ALL CAPS words
-            return bool(re.match(r'^[A-Z0-9][A-Z0-9\s\-/()&]{2,80}$', l))
+            for raw in lines:
+                line = raw.rstrip()
+                stripped = line.strip()
+                if not stripped:
+                    flush_paragraph()
+                    continue
 
-        def is_h3(line: str) -> bool:
-            l = line.strip()
-            if len(l) < 2 or len(l) > 80:
-                return False
-            if is_h2(l):
-                return False
-            # Title Case (allow small connector words)
-            return bool(re.match(r'^(?:[A-Z][\w()\-/]*)(?:\s+(?:[A-Z][\w()\-/]*|of|and|to|for|in|on|with|the|a|an))*$', l))
+                m = bullet_re.match(line)
+                if m:
+                    flush_paragraph()
+                    indent = m.group('indent') or ''
+                    level = 1 + min(2, len(indent) // 2)
+                    txt = m.group('text').strip()
+                    bullet_text = f"• {txt}"
+                    style = bullet1_style if level == 1 else (bullet2_style if level == 2 else bullet3_style)
+                    story.append(Paragraph(esc(bullet_text), style))
+                    continue
 
-        bullet_re = re.compile(r'^(?P<indent>\s*)(?:(?:[\*\-\+])|(?:\d+\.))\s+(?P<text>.+)$')
+                if is_h2(stripped):
+                    flush_paragraph()
+                    heading = stripped[:-1].strip() if stripped.endswith(':') else stripped
+                    story.append(Paragraph(esc(heading), h2_style))
+                    continue
+                if is_h3(stripped):
+                    flush_paragraph()
+                    story.append(Paragraph(esc(stripped), h3_style))
+                    continue
 
-        lines = text.split('\n')
-        paragraph_buf = []
+                paragraph_buf.append(stripped)
 
-        def flush_paragraph():
-            if paragraph_buf:
-                paragraph_text = ' '.join(paragraph_buf).strip()
-                if paragraph_text:
-                    story.append(Paragraph(esc(paragraph_text), body_style))
-                paragraph_buf.clear()
+            flush_paragraph()
 
-        for raw in lines:
-            line = raw.rstrip()
-            stripped = line.strip()
-            if not stripped:
-                flush_paragraph()
-                continue
-
-            # Bulleted item
-            m = bullet_re.match(line)
-            if m:
-                flush_paragraph()
-                indent = m.group('indent') or ''
-                level = 1 + min(2, len(indent) // 2)
-                txt = m.group('text').strip()
-                bullet_text = f"• {txt}"
-                style = bullet1_style if level == 1 else (bullet2_style if level == 2 else bullet3_style)
-                story.append(Paragraph(esc(bullet_text), style))
-                continue
-
-            # Headings
-            if is_h2(stripped):
-                flush_paragraph()
-                heading = stripped[:-1].strip() if stripped.endswith(':') else stripped
-                story.append(Paragraph(esc(heading), h2_style))
-                continue
-            if is_h3(stripped):
-                flush_paragraph()
-                story.append(Paragraph(esc(stripped), h3_style))
-                continue
-
-            # Regular paragraph line (will be joined until blank line)
-            paragraph_buf.append(stripped)
-
-        flush_paragraph()
-
-        try:
-            doc.build(story)
-        except Exception as e:
-            return jsonify({"error": f"Failed to render PDF: {e}"}), 500
-
-        @after_this_request
-        def _cleanup(resp):
+            # Append appendices
             try:
-                os.remove(out_path)
-            except OSError:
-                pass
-            return resp
+                quality = artifacts.get("quality") if isinstance(artifacts, dict) else None
+                conflicts = artifacts.get("conflicts") if isinstance(artifacts, dict) else None
+                provenance = artifacts.get("provenance") if isinstance(artifacts, dict) else None
+            except Exception:
+                quality, conflicts, provenance = None, None, None
 
-        return send_file(
-            out_path,
-            as_attachment=True,
-            download_name=f"document_{target_format}.pdf",
-            mimetype="application/pdf"
-        )
+            if quality and isinstance(quality, dict):
+                story.append(PageBreak())
+                story.append(Paragraph('QUALITY REPORT', header_style))
+                story.append(Spacer(1, 0.15*inch))
+                try:
+                    outline = quality.get('outline') or {}
+                    prov = quality.get('provenance') or {}
+                    numeric = quality.get('numeric') or {}
+                    overall = quality.get('overall_score')
+                    story.append(Paragraph(esc(f"Overall Score: {overall}"), h2_style))
+                    story.append(Paragraph('Outline Coverage', h3_style))
+                    story.append(Paragraph(esc(f"Covered {outline.get('covered',0)} of {outline.get('total',0)} ({outline.get('coverage',0)})"), body_style))
+                    missing = outline.get('missing') or []
+                    if missing:
+                        story.append(Paragraph('Missing Sections:', h3_style))
+                        for m in missing[:10]:
+                            story.append(Paragraph(esc(f"- {m}"), body_style))
+                    story.append(Paragraph('Provenance Coverage', h3_style))
+                    story.append(Paragraph(esc(f"Lines with sources: {prov.get('with_sources',0)}/{prov.get('lines',0)} ({prov.get('coverage',0)})"), body_style))
+                    story.append(Paragraph(esc(f"Avg top score: {prov.get('avg_top_score',0)}"), body_style))
+                    story.append(Paragraph('Numeric Alignment', h3_style))
+                    story.append(Paragraph(esc(f"Numbers matched: {numeric.get('matched',0)}/{numeric.get('numbers',0)} ({numeric.get('match_ratio',0)})"), body_style))
+                except Exception:
+                    pass
+
+            if conflicts and isinstance(conflicts, list):
+                story.append(PageBreak())
+                story.append(Paragraph('CONFLICTS SUMMARY', header_style))
+                story.append(Spacer(1, 0.15*inch))
+                for c in conflicts[:50]:
+                    label = c.get('label', 'value')
+                    story.append(Paragraph(esc(f"Label: {label}"), h2_style))
+                    for val_entry in c.get('values', [])[:10]:
+                        val = val_entry.get('value', '')
+                        story.append(Paragraph(esc(f"Value: {val}"), h3_style))
+                        for occ in val_entry.get('occurrences', [])[:10]:
+                            fn = occ.get('filename', 'unknown')
+                            raw = occ.get('raw', '')
+                            story.append(Paragraph(esc(f"- {fn}: {raw}"), body_style))
+                        story.append(Spacer(1, 0.1*inch))
+
+            if provenance and isinstance(provenance, list):
+                story.append(PageBreak())
+                story.append(Paragraph('PROVENANCE (Top matches per synthesized line)', header_style))
+                story.append(Spacer(1, 0.15*inch))
+                for m in provenance[:200]:
+                    line_idx = m.get('line_index')
+                    line = m.get('line', '')
+                    story.append(Paragraph(esc(f"Line {line_idx}: {line}"), h3_style))
+                    for src in m.get('sources', [])[:5]:
+                        fi = src.get('file_index')
+                        pg = src.get('page')
+                        sc = src.get('score')
+                        story.append(Paragraph(esc(f"- file #{fi}, page {pg}, score {sc}"), body_style))
+                    story.append(Spacer(1, 0.08*inch))
+
+            try:
+                doc.build(story)
+            except Exception as e:
+                return jsonify({"error": f"Failed to render PDF: {e}"}), 500
+
+            @after_this_request
+            def _cleanup(resp):
+                try:
+                    os.remove(out_path)
+                except OSError:
+                    pass
+                return resp
+
+            return send_file(
+                out_path,
+                as_attachment=True,
+                download_name=f"document_{target_format}.pdf",
+                mimetype="application/pdf"
+            )
+
+        # DOCX export
+        if output_format == "docx":
+            try:
+                from docx import Document
+            except Exception as e:
+                return jsonify({"error": f"python-docx not installed: {e}. Please add python-docx to requirements."}), 500
+
+            docx_path = os.path.join(app.config["UPLOAD_FOLDER"], f"synthesis_{uuid.uuid4()}.docx")
+            document = Document()
+
+            # Title
+            title_map = {"report": "SYNTHESIZED REPORT", "brief": "SYNTHESIZED BRIEF", "minutes": "SYNTHESIZED MINUTES"}
+            document.add_heading(title_map.get(target_format, "SYNTHESIZED REPORT"), level=1)
+
+            # Parse AI text similar to PDF branch
+            import re
+            text = ai_text.replace('\r\n', '\n')
+            text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
+            text = re.sub(r'(?<=[\n\.;:])\s*(?:\*|\-|\+)\s+', '\n* ', text)
+
+            def is_h2(line: str) -> bool:
+                l = line.strip()
+                if len(l) < 2 or len(l) > 80:
+                    return False
+                if l.endswith(':'):
+                    return True
+                return bool(re.match(r'^[A-Z0-9][A-Z0-9\s\-/()&]{2,80}$', l))
+
+            def is_h3(line: str) -> bool:
+                l = line.strip()
+                if len(l) < 2 or len(l) > 80:
+                    return False
+                if is_h2(l):
+                    return False
+                return bool(re.match(r'^(?:[A-Z][\w()\-/]*)(?:\s+(?:[A-Z][\w()\-/]*|of|and|to|for|in|on|with|the|a|an))*$', l))
+
+            bullet_re = re.compile(r'^(?P<indent>\s*)(?:(?:[\*\-\+])|(?:\d+\.))\s+(?P<text>.+)$')
+            lines = text.split('\n')
+            paragraph_buf = []
+
+            def flush_paragraph():
+                if paragraph_buf:
+                    paragraph_text = ' '.join(paragraph_buf).strip()
+                    if paragraph_text:
+                        document.add_paragraph(paragraph_text)
+                    paragraph_buf.clear()
+
+            for raw in lines:
+                line = raw.rstrip()
+                stripped = line.strip()
+                if not stripped:
+                    flush_paragraph()
+                    continue
+
+                m = bullet_re.match(line)
+                if m:
+                    flush_paragraph()
+                    indent = m.group('indent') or ''
+                    level = 1 + min(2, len(indent) // 2)
+                    txt = m.group('text').strip()
+                    p = document.add_paragraph(txt)
+                    p.style = 'List Bullet' if level == 1 else ('List Bullet 2' if level == 2 else 'List Bullet 3')
+                    continue
+
+                if is_h2(stripped):
+                    flush_paragraph()
+                    document.add_heading(stripped[:-1].strip() if stripped.endswith(':') else stripped, level=2)
+                    continue
+                if is_h3(stripped):
+                    flush_paragraph()
+                    document.add_heading(stripped, level=3)
+                    continue
+
+                paragraph_buf.append(stripped)
+
+            flush_paragraph()
+
+            # Append appendices
+            quality = artifacts.get("quality") if isinstance(artifacts, dict) else None
+            conflicts = artifacts.get("conflicts") if isinstance(artifacts, dict) else None
+            provenance = artifacts.get("provenance") if isinstance(artifacts, dict) else None
+
+            if quality and isinstance(quality, dict):
+                document.add_page_break()
+                document.add_heading('QUALITY REPORT', level=1)
+                outline = quality.get('outline') or {}
+                prov = quality.get('provenance') or {}
+                numeric = quality.get('numeric') or {}
+                overall = quality.get('overall_score')
+                document.add_paragraph(f"Overall Score: {overall}")
+                document.add_heading('Outline Coverage', level=2)
+                document.add_paragraph(f"Covered {outline.get('covered',0)} of {outline.get('total',0)} ({outline.get('coverage',0)})")
+                missing = outline.get('missing') or []
+                if missing:
+                    document.add_paragraph('Missing Sections:')
+                    for m in missing[:10]:
+                        p = document.add_paragraph(f"- {m}")
+                        p.style = 'List Bullet'
+                document.add_heading('Provenance Coverage', level=2)
+                document.add_paragraph(f"Lines with sources: {prov.get('with_sources',0)}/{prov.get('lines',0)} ({prov.get('coverage',0)})")
+                document.add_paragraph(f"Avg top score: {prov.get('avg_top_score',0)}")
+                document.add_heading('Numeric Alignment', level=2)
+                document.add_paragraph(f"Numbers matched: {numeric.get('matched',0)}/{numeric.get('numbers',0)} ({numeric.get('match_ratio',0)})")
+
+            if conflicts and isinstance(conflicts, list):
+                document.add_page_break()
+                document.add_heading('CONFLICTS SUMMARY', level=1)
+                for c in conflicts[:50]:
+                    label = c.get('label','value')
+                    document.add_heading(f"Label: {label}", level=2)
+                    for val_entry in c.get('values', [])[:10]:
+                        val = val_entry.get('value','')
+                        document.add_heading(f"Value: {val}", level=3)
+                        for occ in val_entry.get('occurrences', [])[:10]:
+                            fn = occ.get('filename','unknown'); raw = occ.get('raw','')
+                            p = document.add_paragraph(f"{fn}: {raw}"); p.style = 'List Bullet'
+
+            if provenance and isinstance(provenance, list):
+                document.add_page_break()
+                document.add_heading('PROVENANCE (Top matches per synthesized line)', level=1)
+                for m in provenance[:200]:
+                    line_idx = m.get('line_index'); line = m.get('line','')
+                    document.add_heading(f"Line {line_idx}: {line}", level=3)
+                    for src in m.get('sources', [])[:5]:
+                        fi = src.get('file_index'); pg = src.get('page'); sc = src.get('score')
+                        p = document.add_paragraph(f"file #{fi}, page {pg}, score {sc}"); p.style = 'List Bullet'
+
+            try:
+                document.save(docx_path)
+            except Exception as e:
+                return jsonify({"error": f"Failed to render DOCX: {e}"}), 500
+
+            @after_this_request
+            def _cleanup_docx(resp):
+                try:
+                    os.remove(docx_path)
+                except OSError:
+                    pass
+                return resp
+
+            return send_file(
+                docx_path,
+                as_attachment=True,
+                download_name=f"document_{target_format}.docx",
+                mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            )
+        if output_format == "pptx":
+            try:
+                from pptx import Presentation
+                from pptx.util import Inches, Pt
+            except Exception as e:
+                return jsonify({"error": f"python-pptx not installed: {e}. Please add python-pptx to requirements."}), 500
+
+            prs = Presentation()
+            slide_layout = prs.slide_layouts[1]  # Title and Content
+
+            # Title slide
+            title_slide = prs.slides.add_slide(prs.slide_layouts[0])
+            title_map = {"report": "SYNTHESIZED REPORT", "brief": "SYNTHESIZED BRIEF", "minutes": "SYNTHESIZED MINUTES"}
+            title_slide.shapes.title.text = title_map.get(target_format, "SYNTHESIZED REPORT")
+            title_slide.placeholders[1].text = "Generated by AI Document Synthesis"
+
+            # Parse AI text into slides by H2 headings
+            import re
+            text = ai_text.replace('\r\n', '\n')
+            text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
+            text = re.sub(r'(?<=[\n\.;:])\s*(?:\*|\-|\+)\s+', '\n* ', text)
+            lines = [ln.rstrip() for ln in text.split('\n')]
+
+            def is_h2(line: str) -> bool:
+                l = line.strip()
+                if len(l) < 2 or len(l) > 80:
+                    return False
+                if l.endswith(':'):
+                    return True
+                return bool(re.match(r'^[A-Z0-9][A-Z0-9\s\-/()&]{2,80}$', l))
+
+            def flush_slide(title: str, bullets: list[str]):
+                if not title and not bullets:
+                    return
+                s = prs.slides.add_slide(slide_layout)
+                s.shapes.title.text = title or "Section"
+                body = s.shapes.placeholders[1].text_frame
+                if bullets:
+                    body.clear()
+                    for b in bullets[:12]:
+                        if not b:
+                            continue
+                        if not body.text:
+                            body.text = b
+                        else:
+                            body.add_paragraph().text = b
+
+            current_title = None
+            current_bullets: list[str] = []
+            for ln in lines:
+                if is_h2(ln.strip()):
+                    flush_slide(current_title, current_bullets)
+                    current_title = ln.strip().rstrip(':')
+                    current_bullets = []
+                    continue
+                if ln.strip().startswith('* '):
+                    current_bullets.append(ln.strip()[2:])
+                else:
+                    # treat plain paragraphs as bullets (trim length)
+                    if ln.strip():
+                        current_bullets.append(ln.strip()[:160])
+            flush_slide(current_title, current_bullets)
+
+            # Append appendices as slides
+            quality = artifacts.get("quality") if isinstance(artifacts, dict) else None
+            conflicts = artifacts.get("conflicts") if isinstance(artifacts, dict) else None
+            provenance = artifacts.get("provenance") if isinstance(artifacts, dict) else None
+
+            if quality:
+                s = prs.slides.add_slide(slide_layout); s.shapes.title.text = 'QUALITY REPORT'
+                body = s.shapes.placeholders[1].text_frame
+                outline = quality.get('outline') or {}; prov = quality.get('provenance') or {}; numeric = quality.get('numeric') or {}
+                body.text = f"Overall Score: {quality.get('overall_score')}"
+                body.add_paragraph().text = f"Outline: {outline.get('covered',0)}/{outline.get('total',0)} ({outline.get('coverage',0)})"
+                body.add_paragraph().text = f"Provenance: {prov.get('with_sources',0)}/{prov.get('lines',0)} ({prov.get('coverage',0)})"
+                body.add_paragraph().text = f"Numeric: {numeric.get('matched',0)}/{numeric.get('numbers',0)} ({numeric.get('match_ratio',0)})"
+
+            if conflicts:
+                s = prs.slides.add_slide(slide_layout); s.shapes.title.text = 'CONFLICTS SUMMARY'
+                body = s.shapes.placeholders[1].text_frame
+                for c in conflicts[:12]:
+                    body.add_paragraph().text = f"Label: {c.get('label','value')}"
+
+            if provenance:
+                s = prs.slides.add_slide(slide_layout); s.shapes.title.text = 'PROVENANCE'
+                body = s.shapes.placeholders[1].text_frame
+                for m in provenance[:12]:
+                    p = body.add_paragraph(); p.text = f"Line {m.get('line_index')}: {m.get('line','')[:120]}"
+
+            pptx_path = os.path.join(app.config["UPLOAD_FOLDER"], f"synthesis_{uuid.uuid4()}.pptx")
+            try:
+                prs.save(pptx_path)
+            except Exception as e:
+                return jsonify({"error": f"Failed to render PPTX: {e}"}), 500
+
+            @after_this_request
+            def _cleanup_pptx(resp):
+                try:
+                    os.remove(pptx_path)
+                except OSError:
+                    pass
+                return resp
+
+            return send_file(
+                pptx_path,
+                as_attachment=True,
+                download_name=f"document_{target_format}.pptx",
+                mimetype="application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            )
+        if output_format == "teams":
+            # Send a simple Teams message via incoming webhook URL
+            teams_webhook = (request.form.get("teams_webhook") or os.getenv("TEAMS_WEBHOOK_URL") or "").strip()
+            if not teams_webhook:
+                return jsonify({"error": "Teams webhook URL missing. Provide 'teams_webhook' form field or set TEAMS_WEBHOOK_URL env."}), 400
+
+            # Construct a summary card-like message
+            summary_lines = ai_text.split('\n')[:20]
+            content = "\n".join(summary_lines)
+            payload = {
+                "text": f"AI Document Synthesis ({target_format})\n\n{content}"
+            }
+            try:
+                r = requests.post(teams_webhook, json=payload, timeout=15)
+                if r.status_code >= 400:
+                    return jsonify({"error": f"Teams webhook error: {r.status_code} {r.text}"}), 502
+            except Exception as e:
+                return jsonify({"error": f"Teams webhook failed: {e}"}), 502
+            return jsonify({"status": "ok", "delivered": True})
 
     except Exception as e:
         return jsonify({"error": f"Synthesis failed: {str(e)}"}), 500
 
+@app.post("/api/extract")
+def api_extract():
+    """MVP extraction endpoint: returns detected document type and basic entities.
+    Input: multipart/form-data with 'file' (PDF)
+    Output: { type, pages, entities: { emails, phones, amounts, dates } }
+    """
+    try:
+        if "file" not in request.files:
+            return jsonify({"error": "No file provided"}), 400
+        file = request.files["file"]
+        if file.filename == "":
+            return jsonify({"error": "No file selected"}), 400
+        if not allowed_pdf(file):
+            return jsonify({"error": "Invalid file type. Only PDF files are allowed."}), 400
+
+        # Persist to temp path for specialized extractors
+        fname = secure_filename(file.filename) or f"upload_{uuid.uuid4()}.pdf"
+        temp_path = os.path.join(app.config["UPLOAD_FOLDER"], f"{uuid.uuid4()}_{fname}")
+        file_bytes = file.read()
+        # Include pipeline version and options in cache key to avoid stale mismatches
+        options_identity = json.dumps({
+            "v": EXTRACT_PIPELINE_VERSION,
+            "domain_override": (request.form.get('domain_override') or '').strip().lower(),
+            "force_tables": (request.form.get('force_tables') or '').strip().lower(),
+            "force_formulas": (request.form.get('force_formulas') or '').strip().lower(),
+            "enrich": (request.form.get('enrich') or '').strip().lower(),
+            "use_ocr": (request.form.get('use_ocr') or '').strip().lower(),
+        }, sort_keys=True)
+        file_hash = hashlib.md5(file_bytes + b"|" + options_identity.encode("utf-8")).hexdigest()
+        # Write file to disk for downstream processors
+        with open(temp_path, 'wb') as f:
+            f.write(file_bytes)
+
+        # Serve from cache if available (no domain_override, no force flags)
+        if not request.form.get('domain_override') and not request.form.get('force_tables') and not request.form.get('force_formulas'):
+            # memory cache
+            cached = EXTRACT_CACHE.get(file_hash)
+            if cached:
+                @after_this_request
+                def _cleanup_cached(resp):
+                    try:
+                        if os.path.isfile(temp_path):
+                            os.remove(temp_path)
+                    except Exception:
+                        pass
+                    return resp
+                return jsonify(cached)
+            # disk cache
+            disk_path = _extract_cache_path(file_hash)
+            try:
+                if os.path.isfile(disk_path):
+                    age = time.time() - os.path.getmtime(disk_path)
+                    if age <= EXTRACT_CACHE_TTL_SECONDS:
+                        with open(disk_path, 'r', encoding='utf-8') as fh:
+                            cached_json = json.load(fh)
+                        EXTRACT_CACHE[file_hash] = cached_json
+                        @after_this_request
+                        def _cleanup_cached(resp):
+                            try:
+                                if os.path.isfile(temp_path):
+                                    os.remove(temp_path)
+                            except Exception:
+                                pass
+                            return resp
+                        return jsonify(cached_json)
+            except Exception:
+                pass
+
+        # Read PDF text quickly
+        reader = PdfReader(temp_path)
+        pages_text = []
+        try:
+            # Parallelize page text extraction
+            from concurrent.futures import ThreadPoolExecutor
+            def _extract_page(i):
+                try:
+                    return reader.pages[i].extract_text() or ""
+                except Exception:
+                    return ""
+            with ThreadPoolExecutor(max_workers=4) as ex:
+                pages_text = list(ex.map(_extract_page, range(len(reader.pages))))
+        except Exception:
+            pages_text = []
+            for p in reader.pages:
+                try:
+                    pages_text.append(p.extract_text() or "")
+                except Exception:
+                    pages_text.append("")
+        all_text = "\n".join(pages_text)
+        inv_index = build_inverted_index(pages_text)
+
+        # Use modular extraction pipeline
+        try:
+            from extraction.pipeline import DocumentTypeDetector, BasicExtractor, DomainFieldMapper, Validator
+            from extraction.specialized import Router as ExtractRouter, TableExtractor, FormulaExtractor
+        except Exception:
+            from backend.extraction.pipeline import DocumentTypeDetector, BasicExtractor, DomainFieldMapper, Validator  # type: ignore
+            from backend.extraction.specialized import Router as ExtractRouter, TableExtractor, FormulaExtractor  # type: ignore
+
+        # Allow client to override detected type
+        override = (request.form.get('domain_override') or '').strip().lower()
+        force_tables = request.form.get('force_tables')
+        force_formulas = request.form.get('force_formulas')
+        ft = (force_tables.lower() in ('1','true','yes')) if isinstance(force_tables, str) else None
+        ff = (force_formulas.lower() in ('1','true','yes')) if isinstance(force_formulas, str) else None
+        # AI-only extraction path
+        result = ai_only_extract(all_text, pages_text)
+        dtype = result.get('type')
+        entities = result.get('entities')
+        mapped = result.get('mapped_fields')
+        validation = result.get('validation')
+        confidence = result.get('confidence')
+        tables = result.get('tables')
+        formulas = result.get('formulas')
+        provenance = result.get('provenance')
+
+        # Provenance mapping for research documents (skip or keep minimal in AI-only mode)
+        if dtype == 'research' and provenance is None:
+            def pages_for_heading_variants(variants):
+                found_pages = []
+                for idx, txt in enumerate(pages_text):
+                    for h in variants:
+                        try:
+                            if re.search(rf"(?mi)^\s*(?:\d+\.?\s*)?{re.escape(h)}\s*:?\s*$", txt):
+                                found_pages.append(idx + 1)
+                                break
+                        except Exception:
+                            continue
+                return sorted(list({p for p in found_pages}))[:10]
+
+            def pages_for_value(value: str, max_hits: int = 5):
+                if not value:
+                    return []
+                pages: list[int] = []
+                try:
+                    tokens = re.findall(r"[A-Za-z][A-Za-z0-9\-]{3,}", value.lower())
+                    candidates: set[int] = set()
+                    for t in tokens[:3]:  # first few informative tokens
+                        for p in inv_index.get(t, []):
+                            candidates.add(p)
+                    for p in sorted(candidates) or range(1, len(pages_text)+1):
+                        txt = pages_text[p-1]
+                        if not txt:
+                            continue
+                        if re.search(re.escape(value.strip()), txt, flags=re.IGNORECASE):
+                            pages.append(p)
+                            if len(pages) >= max_hits:
+                                break
+                except Exception:
+                    pass
+                return pages
+
+            def entries_with_pages(values: list[str]):
+                out = []
+                for v in values or []:
+                    out.append({"value": v, "pages": pages_for_value(v)})
+                return out
+
+            sections = {}
+            # Section heading variants (mirror of mapper)
+            ABSTRACT = ["abstract"]
+            METHODS = ["methods", "method", "methodology", "materials and methods", "experimental", "study design"]
+            RESULTS = ["results", "findings"]
+            CONCLUSIONS = ["conclusion", "conclusions", "discussion and conclusion", "summary"]
+            REFERENCES = ["references", "bibliography"]
+
+            if mapped.get('abstract'):
+                sections['abstract'] = pages_for_heading_variants(ABSTRACT) or pages_for_value((mapped.get('abstract') or '')[:80])
+            if mapped.get('methodology'):
+                sections['methodology'] = pages_for_heading_variants(METHODS) or pages_for_value((mapped.get('methodology') or '')[:80])
+            if mapped.get('results'):
+                sections['results'] = pages_for_heading_variants(RESULTS) or pages_for_value((mapped.get('results') or '')[:80])
+            if mapped.get('conclusions'):
+                sections['conclusions'] = pages_for_heading_variants(CONCLUSIONS) or pages_for_value((mapped.get('conclusions') or '')[:80])
+            if mapped.get('references'):
+                sections['references'] = pages_for_heading_variants(REFERENCES)
+
+            # DOI and citations
+            doi_pages = pages_for_value(mapped.get('doi')) if mapped.get('doi') else []
+            citations_entries = entries_with_pages(mapped.get('citations') or [])
+
+            # Metrics
+            metrics = mapped.get('research_metrics') or {}
+            metrics_prov = {
+                'p_values': entries_with_pages(metrics.get('p_values') or []),
+                'sample_sizes': entries_with_pages(metrics.get('sample_sizes') or []),
+                'confidence_intervals': entries_with_pages(metrics.get('confidence_intervals') or []),
+                'effect_sizes': entries_with_pages(metrics.get('effect_sizes') or []),
+                'means_sd': entries_with_pages(metrics.get('means_sd') or []),
+                'percentages': entries_with_pages(metrics.get('percentages') or []),
+            }
+
+            # Authors/Affiliations pages (aggregate)
+            authors_pages = sorted(list({p for a in (mapped.get('authors') or []) for p in pages_for_value(a) }))[:10]
+            affiliations_pages = sorted(list({p for a in (mapped.get('affiliations') or []) for p in pages_for_value(a) }))[:10]
+
+            # Aggregate table pages too
+            table_pages = sorted(list({t.get('page') for t in (tables or []) if isinstance(t, dict) and t.get('page')}))
+
+            provenance = {
+                'sections': sections,
+                'doi_pages': doi_pages,
+                'citations': citations_entries,
+                'metrics': metrics_prov,
+                'authors_pages': authors_pages,
+                'affiliations_pages': affiliations_pages,
+                'table_pages': table_pages,
+            }
+
+        # Optional LLM enrichment
+        enrich_flag = (request.form.get('enrich') or '').strip().lower() in ("1","true","yes")
+        if enrich_flag:
+            try:
+                print("DEBUG: Starting enrichment (sync endpoint)")
+                sys.stdout.flush()
+            except Exception:
+                pass
+            try:
+                enriched = enrich_extraction_with_llm(dtype, mapped, all_text, pages_text, inv_index)
+                new_mapped = enriched.get('mapped_fields', mapped)
+                if isinstance(new_mapped, dict):
+                    mapped = new_mapped
+                # Re-score confidence if enrichment occurred
+                if isinstance(mapped, dict) and mapped.get('enriched'):
+                    try:
+                        confidence = ConfidenceScorer().score(dtype, mapped, entities, validation, provenance)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        resp_json = {
+            "type": dtype,
+            "pages": len(pages_text),
+            "entities": entities,
+            "mapped_fields": mapped,
+            "validation": validation,
+            "confidence": confidence,
+            "tables": tables,
+            "formulas": formulas,
+            "provenance": provenance,
+        }
+
+        @after_this_request
+        def _cleanup(resp):
+            try:
+                if os.path.isfile(temp_path):
+                    os.remove(temp_path)
+            except Exception:
+                pass
+            return resp
+
+        # Save to cache
+        try:
+            EXTRACT_CACHE[file_hash] = resp_json
+            # persist to disk
+            disk_path = _extract_cache_path(file_hash)
+            with open(disk_path, 'w', encoding='utf-8') as fh:
+                json.dump(resp_json, fh)
+        except Exception:
+            pass
+        return jsonify(resp_json)
+    except Exception as e:
+        return jsonify({"error": f"Extraction failed: {str(e)}"}), 500
+
+@app.post("/api/extract/async")
+def api_extract_async():
+    try:
+        if "file" not in request.files:
+            return jsonify({"error": "No file provided"}), 400
+        upfile = request.files["file"]
+        if upfile.filename == "":
+            return jsonify({"error": "No file selected"}), 400
+        if not allowed_pdf(upfile):
+            return jsonify({"error": "Invalid file type. Only PDF files are allowed."}), 400
+
+        fname = secure_filename(upfile.filename) or f"upload_{uuid.uuid4()}.pdf"
+        temp_path = os.path.join(app.config["UPLOAD_FOLDER"], f"{uuid.uuid4()}_{fname}")
+        upfile.save(temp_path)
+
+        # Read form parameters before starting background thread
+        override = (request.form.get('domain_override') or '').strip().lower()
+        enrich_flag = (request.form.get('enrich') or '').strip().lower() in ("1","true","yes")
+        use_ocr_flag = (request.form.get('use_ocr') or '').strip().lower() in ("1","true","yes")
+
+        job_id = str(uuid.uuid4())
+        with EXTRACT_JOBS_LOCK:
+            EXTRACT_JOBS[job_id] = {"progress": 0, "done": False, "error": None, "result": None}
+
+        def run_job(jid: str, path: str, override: str, enrich_flag: bool, use_ocr_flag: bool):
+            def set_progress(p: int):
+                with EXTRACT_JOBS_LOCK:
+                    if jid in EXTRACT_JOBS:
+                        EXTRACT_JOBS[jid]["progress"] = max(0, min(100, int(p)))
+            try:
+                set_progress(5)
+                pages_text = []
+                if use_ocr_flag and _OCR_SERVICE is not None:
+                    try:
+                        ocr_result = _OCR_SERVICE.hybrid_extraction(path)
+                        if ocr_result.get('success'):
+                            pages_text = [p.get('text') or "" for p in (ocr_result.get('pages') or [])]
+                        else:
+                            reader = PdfReader(path)
+                            for p in reader.pages:
+                                try:
+                                    pages_text.append(p.extract_text() or "")
+                                except Exception:
+                                    pages_text.append("")
+                    except Exception:
+                        reader = PdfReader(path)
+                        for p in reader.pages:
+                            try:
+                                pages_text.append(p.extract_text() or "")
+                            except Exception:
+                                pages_text.append("")
+                else:
+                    reader = PdfReader(path)
+                    try:
+                        from concurrent.futures import ThreadPoolExecutor
+                        def _extract_page(i):
+                            try:
+                                return reader.pages[i].extract_text() or ""
+                            except Exception:
+                                return ""
+                        with ThreadPoolExecutor(max_workers=4) as ex:
+                            pages_text = list(ex.map(_extract_page, range(len(reader.pages))))
+                    except Exception:
+                        pages_text = []
+                        for p in reader.pages:
+                            try:
+                                pages_text.append(p.extract_text() or "")
+                            except Exception:
+                                pages_text.append("")
+                all_text = "\n".join(pages_text)
+                set_progress(20)
+
+                # Import pipeline components within the worker context
+                try:
+                    from extraction.pipeline import DocumentTypeDetector, BasicExtractor, DomainFieldMapper, Validator, ConfidenceScorer
+                    from extraction.specialized import Router as ExtractRouter, TableExtractor, FormulaExtractor
+                except Exception:
+                    from backend.extraction.pipeline import DocumentTypeDetector, BasicExtractor, DomainFieldMapper, Validator, ConfidenceScorer  # type: ignore
+                    from backend.extraction.specialized import Router as ExtractRouter, TableExtractor, FormulaExtractor  # type: ignore
+
+                # AI-only extraction path in async job
+                result = ai_only_extract(all_text, pages_text)
+                dtype = result.get('type')
+                entities = result.get('entities')
+                mapped = result.get('mapped_fields')
+                validation = result.get('validation')
+                tables = result.get('tables')
+                formulas = result.get('formulas')
+                provenance = result.get('provenance')
+                confidence = result.get('confidence')
+                set_progress(70)
+
+                provenance = None
+                if dtype == 'research':
+                    def pages_for_heading_variants(variants):
+                        found_pages = []
+                        for idx, txt in enumerate(pages_text):
+                            for h in variants:
+                                try:
+                                    if re.search(rf"(?mi)^\s*(?:\d+\.?\s*)?{re.escape(h)}\s*:?\s*$", txt):
+                                        found_pages.append(idx + 1)
+                                        break
+                                except Exception:
+                                    continue
+                        return sorted(list({p for p in found_pages}))[:10]
+                    def pages_for_value(value: str, max_hits: int = 5):
+                        if not value:
+                            return []
+                        pages: list[int] = []
+                        try:
+                            tokens = re.findall(r"[A-Za-z][A-Za-z0-9\-]{3,}", value.lower())
+                            candidates: set[int] = set()
+                            for t in tokens[:3]:  # first few informative tokens
+                                for p in inv_index.get(t, []):
+                                    candidates.add(p)
+                            for p in sorted(candidates) or range(1, len(pages_text)+1):
+                                txt = pages_text[p-1]
+                                if not txt:
+                                    continue
+                                if re.search(re.escape(value.strip()), txt, flags=re.IGNORECASE):
+                                    pages.append(p)
+                                    if len(pages) >= max_hits:
+                                        break
+                        except Exception:
+                            pass
+                        return pages
+                    def entries_with_pages(values: list[str]):
+                        out = []
+                        for v in values or []:
+                            out.append({"value": v, "pages": pages_for_value(v)})
+                        return out
+                    sections = {}
+                    ABSTRACT = ["abstract"]
+                    METHODS = ["methods", "method", "methodology", "materials and methods", "experimental", "study design"]
+                    RESULTS = ["results", "findings"]
+                    CONCLUSIONS = ["conclusion", "conclusions", "discussion and conclusion", "summary"]
+                    REFERENCES = ["references", "bibliography"]
+                    if mapped.get('abstract'):
+                        sections['abstract'] = pages_for_heading_variants(ABSTRACT) or pages_for_value((mapped.get('abstract') or '')[:80])
+                    if mapped.get('methodology'):
+                        sections['methodology'] = pages_for_heading_variants(METHODS) or pages_for_value((mapped.get('methodology') or '')[:80])
+                    if mapped.get('results'):
+                        sections['results'] = pages_for_heading_variants(RESULTS) or pages_for_value((mapped.get('results') or '')[:80])
+                    if mapped.get('conclusions'):
+                        sections['conclusions'] = pages_for_heading_variants(CONCLUSIONS) or pages_for_value((mapped.get('conclusions') or '')[:80])
+                    if mapped.get('references'):
+                        sections['references'] = pages_for_heading_variants(REFERENCES)
+                    doi_pages = pages_for_value(mapped.get('doi')) if mapped.get('doi') else []
+                    citations_entries = entries_with_pages(mapped.get('citations') or [])
+                    metrics = mapped.get('research_metrics') or {}
+                    metrics_prov = {
+                        'p_values': entries_with_pages(metrics.get('p_values') or []),
+                        'sample_sizes': entries_with_pages(metrics.get('sample_sizes') or []),
+                        'confidence_intervals': entries_with_pages(metrics.get('confidence_intervals') or []),
+                        'effect_sizes': entries_with_pages(metrics.get('effect_sizes') or []),
+                        'means_sd': entries_with_pages(metrics.get('means_sd') or []),
+                        'percentages': entries_with_pages(metrics.get('percentages') or []),
+                    }
+                    authors_pages = sorted(list({p for a in (mapped.get('authors') or []) for p in pages_for_value(a) }))[:10]
+                    affiliations_pages = sorted(list({p for a in (mapped.get('affiliations') or []) for p in pages_for_value(a) }))[:10]
+                    table_pages = sorted(list({t.get('page') for t in (tables or []) if isinstance(t, dict) and t.get('page')}))
+                    provenance = {
+                        'sections': sections,
+                        'doi_pages': doi_pages,
+                        'citations': citations_entries,
+                        'metrics': metrics_prov,
+                        'authors_pages': authors_pages,
+                        'affiliations_pages': affiliations_pages,
+                        'table_pages': table_pages,
+                    }
+                set_progress(85)
+                confidence = ConfidenceScorer().score(dtype, mapped, entities, validation, provenance)
+                set_progress(98)
+
+                # Optional enrichment using flag passed to thread
+                if enrich_flag:
+                    try:
+                        print("DEBUG: Starting enrichment (async endpoint)")
+                        sys.stdout.flush()
+                    except Exception:
+                        pass
+                    try:
+                        enriched = enrich_extraction_with_llm(dtype, mapped, all_text, pages_text, build_inverted_index(pages_text))
+                        new_mapped = enriched.get('mapped_fields', mapped)
+                        if isinstance(new_mapped, dict):
+                            mapped = new_mapped
+                        if isinstance(mapped, dict) and mapped.get('enriched'):
+                            try:
+                                confidence = ConfidenceScorer().score(dtype, mapped, entities, validation, provenance)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+
+                result = {
+                    "type": dtype,
+                    "pages": len(pages_text),
+                    "entities": entities,
+                    "mapped_fields": mapped,
+                    "validation": validation,
+                    "confidence": confidence,
+                    "tables": tables,
+                    "formulas": formulas,
+                    "provenance": provenance,
+                }
+                with EXTRACT_JOBS_LOCK:
+                    if jid in EXTRACT_JOBS:
+                        EXTRACT_JOBS[jid]["result"] = result
+                        EXTRACT_JOBS[jid]["done"] = True
+                        EXTRACT_JOBS[jid]["progress"] = 100
+            except Exception as e:
+                with EXTRACT_JOBS_LOCK:
+                    if jid in EXTRACT_JOBS:
+                        EXTRACT_JOBS[jid]["error"] = str(e)
+                        EXTRACT_JOBS[jid]["done"] = True
+                        EXTRACT_JOBS[jid]["progress"] = 100
+            finally:
+                try:
+                    if os.path.isfile(path):
+                        os.remove(path)
+                except Exception:
+                    pass
+
+        th = threading.Thread(target=run_job, args=(job_id, temp_path, override, enrich_flag, use_ocr_flag), daemon=True)
+        th.start()
+        return jsonify({"job_id": job_id})
+    except Exception as e:
+        return jsonify({"error": f"Failed to start async extract: {e}"}), 500
+
+@app.get("/api/extract/status/<job_id>")
+def api_extract_status(job_id: str):
+    with EXTRACT_JOBS_LOCK:
+        job = EXTRACT_JOBS.get(job_id)
+        if not job:
+            return jsonify({"error": "not_found"}), 404
+        return jsonify({
+            "job_id": job_id,
+            "progress": job.get("progress", 0),
+            "done": job.get("done", False),
+            "error": job.get("error"),
+            "result": job.get("result") if job.get("done") else None,
+        })
+
+@app.post("/api/extract/pdf")
+def api_extract_pdf():
+    """Generate a nicely formatted Extraction PDF on the server.
+    Accepts: multipart/form-data
+      - file: the PDF
+      - domain_override (optional)
+      - enrich (optional: 'true'|'false')
+    Returns: application/pdf stream
+    """
+    try:
+        if "file" not in request.files:
+            return jsonify({"error": "No file provided"}), 400
+        file = request.files["file"]
+        if file.filename == "":
+            return jsonify({"error": "No file selected"}), 400
+        if not allowed_pdf(file):
+            return jsonify({"error": "Invalid file type. Only PDF files are allowed."}), 400
+
+        # Reuse synchronous extract logic to get structured data
+        # Save to temp
+        fname = secure_filename(file.filename) or f"upload_{uuid.uuid4()}.pdf"
+        temp_path = os.path.join(app.config["UPLOAD_FOLDER"], f"{uuid.uuid4()}_{fname}")
+        file.save(temp_path)
+
+        # Run extraction pipeline (similar to /api/extract)
+        reader = PdfReader(temp_path)
+        pages_text = []
+        try:
+            for p in reader.pages:
+                try:
+                    pages_text.append(p.extract_text() or "")
+                except Exception:
+                    pages_text.append("")
+        except Exception:
+            pages_text = []
+        all_text = "\n".join(pages_text)
+
+        try:
+            from extraction.pipeline import DocumentTypeDetector, BasicExtractor, DomainFieldMapper, Validator, ConfidenceScorer
+            from extraction.specialized import Router as ExtractRouter, TableExtractor, FormulaExtractor
+        except Exception:
+            from backend.extraction.pipeline import DocumentTypeDetector, BasicExtractor, DomainFieldMapper, Validator, ConfidenceScorer  # type: ignore
+            from backend.extraction.specialized import Router as ExtractRouter, TableExtractor, FormulaExtractor  # type: ignore
+
+        override = (request.form.get('domain_override') or '').strip().lower()
+        enrich_flag = (request.form.get('enrich') or '').strip().lower() in ("1","true","yes")
+
+        # AI-only extraction for PDF endpoint
+        result = ai_only_extract(all_text, pages_text)
+        dtype = result.get('type')
+        entities = result.get('entities')
+        mapped = result.get('mapped_fields')
+        validation = result.get('validation')
+        tables = result.get('tables')
+        formulas = result.get('formulas')
+        confidence = result.get('confidence')
+
+        # Enrichment toggle in AI-only mode: no-op or could request extended fields in prompt
+        if enrich_flag:
+            try:
+                print("DEBUG: Enrich flag acknowledged (pdf endpoint, AI-only mode)")
+                sys.stdout.flush()
+            except Exception:
+                pass
+
+        # Build PDF in-memory using ReportLab
+        buffer = io.BytesIO()
+        doc = SimpleDocTemplate(buffer, pagesize=A4, leftMargin=56, rightMargin=56, topMargin=56, bottomMargin=56)
+        styles = getSampleStyleSheet()
+        elems = []
+
+        title_style = styles['Heading1']
+        title_style.textColor = colors.HexColor("#1f2937")
+        elems.append(Paragraph("Extraction Report", title_style))
+        elems.append(Spacer(1, 10))
+
+        meta_style = styles['Normal']
+        elems.append(Paragraph(f"Detected Type: <b>{dtype or 'general'}</b>", meta_style))
+        elems.append(Paragraph(f"Pages: <b>{len(pages_text)}</b>", meta_style))
+        elems.append(Spacer(1, 10))
+
+        # Confidence
+        if confidence:
+            elems.append(Paragraph("<b>Confidence</b>", styles['Heading3']))
+            elems.append(Paragraph(f"Overall: {confidence.get('overall','-')}%", meta_style))
+            fields_conf = confidence.get('fields') or {}
+            if fields_conf:
+                bullets = [Paragraph(f"{k}: {v}%", meta_style) for k, v in fields_conf.items()]
+                elems.append(ListFlowable([ListItem(b, leftIndent=10) for b in bullets], bulletType='bullet'))
+            elems.append(Spacer(1, 8))
+
+        # Mapped fields
+        if mapped:
+            elems.append(Paragraph("<b>Mapped Fields</b>", styles['Heading3']))
+            def _to_text(val):
+                try:
+                    if isinstance(val, (list, tuple)):
+                        return ", ".join(_to_text(x) for x in val)
+                    if isinstance(val, dict):
+                        return json.dumps(val, ensure_ascii=False)
+                    return str(val)
+                except Exception:
+                    return str(val)
+            for k, v in (mapped or {}).items():
+                if k in ("enrichment", "enriched"):
+                    continue
+                text_value = _to_text(v)
+                elems.append(Paragraph(f"• <b>{k}:</b> {text_value}", meta_style))
+            elems.append(Spacer(1, 8))
+
+        # Enrichment
+        enr = (mapped or {}).get("enrichment") or {}
+        if enr:
+            elems.append(Paragraph("<b>AI Enrichment</b>", styles['Heading3']))
+            def _bullet_list(items):
+                return ListFlowable([ListItem(Paragraph(str(it), meta_style), leftIndent=10) for it in items], bulletType='bullet')
+            if isinstance(enr.get("diagnoses"), list) and enr["diagnoses"]:
+                elems.append(Paragraph("Diagnoses", meta_style))
+                elems.append(_bullet_list(enr["diagnoses"][:20]))
+            if isinstance(enr.get("procedures"), list) and enr["procedures"]:
+                elems.append(Paragraph("Procedures", meta_style))
+                elems.append(_bullet_list(enr["procedures"][:20]))
+            if isinstance(enr.get("labs_normalized"), list) and enr["labs_normalized"]:
+                elems.append(Paragraph("Labs (normalized)", meta_style))
+                labs_lines = [json.dumps(x) for x in enr["labs_normalized"][:20]]
+                elems.append(_bullet_list(labs_lines))
+            if isinstance(enr.get("obligations"), list) and enr["obligations"]:
+                elems.append(Paragraph("Obligations", meta_style))
+                elems.append(_bullet_list(enr["obligations"][:20]))
+            if isinstance(enr.get("termination_conditions"), list) and enr["termination_conditions"]:
+                elems.append(Paragraph("Termination Conditions", meta_style))
+                elems.append(_bullet_list(enr["termination_conditions"][:20]))
+            if isinstance(enr.get("key_findings"), list) and enr["key_findings"]:
+                elems.append(Paragraph("Key Findings", meta_style))
+                elems.append(_bullet_list(enr["key_findings"][:20]))
+            if isinstance(enr.get("primary_outcomes"), list) and enr["primary_outcomes"]:
+                elems.append(Paragraph("Primary Outcomes", meta_style))
+                elems.append(_bullet_list(enr["primary_outcomes"][:20]))
+            elems.append(Spacer(1, 8))
+
+        # Tables (first few)
+        if tables:
+            elems.append(Paragraph("<b>Tables (preview)</b>", styles['Heading3']))
+            max_preview = min(2, len(tables))
+            for idx in range(max_preview):
+                t = tables[idx]
+                page_no = t.get('page')
+                elems.append(Paragraph(f"Table on page {page_no}", meta_style))
+            elems.append(Spacer(1, 8))
+
+        # Formulas (first few)
+        if formulas:
+            elems.append(Paragraph("<b>Formulas (first 10)</b>", styles['Heading3']))
+            for f in (formulas[:10] or []):
+                elems.append(Paragraph(f, meta_style))
+            elems.append(Spacer(1, 8))
+
+        # Validation issues
+        if validation:
+            errors = (validation.get('errors') or [])
+            warnings = (validation.get('warnings') or [])
+            if errors:
+                elems.append(Paragraph("<b>Validation Errors</b>", styles['Heading3']))
+                elems.append(ListFlowable([ListItem(Paragraph(e, meta_style), leftIndent=10) for e in errors], bulletType='bullet'))
+            if warnings:
+                elems.append(Paragraph("<b>Validation Warnings</b>", styles['Heading3']))
+                elems.append(ListFlowable([ListItem(Paragraph(w, meta_style), leftIndent=10) for w in warnings], bulletType='bullet'))
+
+        doc.build(elems)
+        buffer.seek(0)
+
+        @after_this_request
+        def _cleanup(resp):
+            try:
+                if os.path.isfile(temp_path):
+                    os.remove(temp_path)
+            except Exception:
+                pass
+            return resp
+
+        return send_file(buffer, as_attachment=True, download_name=f"extraction_report.pdf", mimetype="application/pdf")
+    except Exception as e:
+        return jsonify({"error": f"Failed to generate extract PDF: {e}"}), 500
+
 # ─────────────────────────────────────────────────────────────────
+
+def ai_only_extract(all_text: str, pages_text: list[str]) -> dict:
+    """Run AI-only extraction with a strict, schema-driven prompt to get exact values.
+    Returns a full response with keys: type, pages, entities, mapped_fields, validation, confidence, tables, formulas, provenance
+    Note: tables/formulas/provenance are left empty in AI-only mode unless we extend the AI prompt.
+    """
+    # Smart chunking to keep guidance intact but cap tokens
+    max_chars = 20000
+    text = all_text or ''
+    if len(text) > max_chars:
+        head = text[:10000]
+        middle = text[len(text)//2 - 2500: len(text)//2 + 2500]
+        tail = text[-5000:]
+        doc_snippet = f"{head}\n\n[MIDDLE]\n\n{middle}\n\n[END]\n\n{tail}"
+    else:
+        doc_snippet = text
+    system = (
+        "You are an expert document information extractor. Return ONLY valid JSON. "
+        "Extract exact values from the text without paraphrasing, keep original formatting of numbers and dates where possible. "
+        "Use null for missing fields."
+    )
+    schema = {
+        "invoice": ["invoice_number", "po_number", "due_date", "total_amount", "subtotal_amount", "tax_amount", "vendor_email"],
+        "contract": ["party_a", "party_b", "governing_law", "term", "contact_email"],
+        "financial": ["statement_type", "period", "currency", "revenue", "cost_of_goods_sold", "gross_profit", "operating_income", "operating_expenses", "net_income", "ebitda", "gross_margin", "operating_margin", "net_margin", "eps", "operating_cash_flow", "free_cash_flow", "total_assets", "total_liabilities", "shareholders_equity", "debt", "cash_and_equivalents", "line_items", "ratios"],
+        "research": ["doi", "citations", "authors", "affiliations", "abstract", "methodology", "results", "conclusions", "references", "research_metrics"],
+        "healthcare": ["patient_id", "mrn", "icd9_codes", "icd10_codes", "cpt_codes", "chief_complaint", "history", "physical_exam", "assessment", "plan", "medications", "allergies", "vitals", "labs", "diagnosis_text", "procedures_text", "primary_contact"],
+        "general": ["summary", "emails", "phones", "amounts", "dates"],
+    }
+    # Ask AI to first detect type, then extract fields for that type.
+    prompt = (
+        "Detect document type as one of: invoice, contract, financial, research, healthcare, general.\n"
+        "Then extract the following fields as strict JSON with keys: {\n"
+        "  \"type\": string,\n"
+        "  \"mapped_fields\": object (domain-specific fields exactly as listed for that type),\n"
+        "  \"entities\": { \"emails\": [], \"phones\": [], \"amounts\": [], \"dates\": [] }\n"
+        "}\n\n"
+        "EXTRACTION RULES:\n"
+        "- Use exact values from the text; do not infer new numbers or paraphrase amounts/dates.\n"
+        "- Preserve formatting for numbers and dates where present.\n"
+        "- If a field is not present, set it to null (or [] for arrays).\n"
+        "- Do not include any keys not listed.\n"
+        "- Return ONLY JSON.\n\n"
+        "INVOICE-SPECIFIC GUIDANCE:\n"
+        "- Invoice number: Look for labels like 'Invoice No.', 'Invoice Number' and extract the exact code following the label\n"
+        "- PO number: Look for 'PO No.' or 'PO Number'\n"
+        "- Due date: Use the date next to 'Due Date'\n"
+        "- Amounts: Prefer values next to 'Total', 'Subtotal', 'Tax'; preserve currency symbols/codes and separators\n"
+        "- Vendor email: Choose a plausible email from the document (e.g., near header/footer/contact)\n\n"
+        "CONTRACT-SPECIFIC GUIDANCE:\n"
+        "- Parties: 'between <Party A> and <Party B>' or 'by and between'—extract exact party names\n"
+        "- Governing law: Look for 'governing law of <Jurisdiction>'\n"
+        "- Term: Durations like '12 months', '3 years' (keep original formatting)\n"
+        "- Contact email: Choose an email near notice or signature sections\n\n"
+        "FINANCIAL-SPECIFIC GUIDANCE:\n"
+        "- Identify statement type: income statement, balance sheet, cash flow\n"
+        "- Period: quarter/year (e.g., Q1 2024, FY 2023); keep exactly as written\n"
+        "- Currency: USD/EUR/GBP or symbol; preserve code/symbol and formatting\n"
+        "- Extract key fields: revenue, cost of goods sold, gross profit, operating income, operating expenses, net income, EBITDA\n"
+        "- Margins/ratios: gross/operating/net margin (%), EPS; list under ratios\n"
+        "- Cash flow: operating cash flow, free cash flow; keep signs and units\n"
+        "- Balance sheet: total assets, total liabilities, shareholders' equity, debt, cash and equivalents\n"
+        "- Line items: include a list of {name, value} for other financial lines\n\n"
+        "RESEARCH-SPECIFIC GUIDANCE:\n"
+        "- Abstract: Look for 'Abstract' section or first paragraph after title\n"
+        "- Methodology: Find 'Methods', 'Methodology', or 'Materials and Methods' sections\n"
+        "- Results: Look for 'Results' or 'Findings' sections\n"
+        "- Conclusions: Find 'Conclusion', 'Discussion', or 'Summary' sections\n"
+        "- DOI: Look for '10.' followed by numbers and slashes (e.g., 10.1038/nature12345)\n"
+        "- Citations: Extract author names with 'et al.' and years in parentheses\n"
+        "- Research metrics: Extract as object with keys: p_values, sample_sizes, confidence_intervals, effect_sizes, means_sd, percentages\n"
+        "- Authors: Extract from title area or author list\n"
+        "- Affiliations: Find university, institute, or organization names\n\n"
+        "HEALTHCARE-SPECIFIC GUIDANCE:\n"
+        "- Patient identifiers: 'Patient ID', 'MRN'—extract exact codes\n"
+        "- Codes: ICD-9/ICD-10 codes (e.g., 'E11.9'), CPT 5-digit codes\n"
+        "- Sections: Chief Complaint, History, Physical Exam, Assessment, Plan\n"
+        "- Medications: Parse 'Name: <dose> <frequency>' lines into objects\n"
+        "- Vitals: BP, HR, RR, Temp, O2—preserve units and formatting\n"
+        "- Labs: Extract as objects {name, value, unit} from lab sections\n\n"
+        "GENERAL-SPECIFIC GUIDANCE:\n"
+        "- Summary: 1-3 sentence summary of document\n"
+        "- Entities: Extract any emails, phones, amounts, and dates present anywhere\n\n"
+        f"Text (truncated):\n{doc_snippet}\n\n"
+        f"Field schema (reference): {json.dumps(schema)}\n"
+    )
+    ai_text = None
+    data = {}
+    # Thread-based timeout for Windows compatibility
+    import threading
+    result_holder = {"text": None, "error": None}
+    def _runner():
+        try:
+            result_holder["text"] = call_ai_service(prompt, system_prompt=system)
+        except Exception as e:
+            result_holder["error"] = str(e)
+    th = threading.Thread(target=_runner, daemon=True)
+    th.start()
+    th.join(timeout=OLLAMA_TIMEOUT)  # reuse overall timeout cap
+    if th.is_alive():
+        try:
+            print("DEBUG: ai_only_extract timed out waiting for AI response")
+            sys.stdout.flush()
+        except Exception:
+            pass
+        result_holder["text"] = None
+        result_holder["error"] = "timeout"
+    ai_text = result_holder["text"] or ""
+    if result_holder["error"] == "timeout":
+        data = {}
+    else:
+        try:
+            data = parse_json_safely(ai_text)
+        except Exception:
+            try:
+                print("DEBUG: ai_only_extract JSON parse failed; falling back to empty result")
+                sys.stdout.flush()
+            except Exception:
+                pass
+            data = {}
+    if not isinstance(data, dict):
+        data = {}
+    dtype = (data.get('type') or 'general').lower()
+    # Ensure minimal structure
+    entities = data.get('entities') or {}
+    mapped = data.get('mapped_fields') or {}
+    # Lightweight validation: ensure only schema fields exist
+    allowed = set(schema.get(dtype, []))
+    mapped_clean = {}
+    for k, v in (mapped.items() if isinstance(mapped, dict) else []):
+        if k in allowed:
+            mapped_clean[k] = v
+    # Confidence is AI-only placeholder: presence-based
+    fields_present = sum(1 for v in mapped_clean.values() if v)
+    fields_total = max(1, len(allowed))
+    overall = int(round(60 + 40 * (fields_present / fields_total))) if fields_total else 60
+    confidence = {"overall": overall, "fields": {k: (85 if mapped_clean.get(k) else 0) for k in allowed}}
+    # Response in the same shape as before
+    return {
+        "type": dtype,
+        "pages": len(pages_text or []),
+        "entities": entities,
+        "mapped_fields": mapped_clean,
+        "validation": {"errors": [], "warnings": []},
+        "confidence": confidence,
+        "tables": [],
+        "formulas": [],
+        "provenance": None,
+    }
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)   # change port if needed
