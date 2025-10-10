@@ -3170,7 +3170,8 @@ def api_extract():
         ft = (force_tables.lower() in ('1','true','yes')) if isinstance(force_tables, str) else None
         ff = (force_formulas.lower() in ('1','true','yes')) if isinstance(force_formulas, str) else None
         # AI-only extraction path
-        result = ai_only_extract(all_text, pages_text)
+        custom_instructions = (request.form.get('custom_instructions') or '').strip()
+        result = ai_only_extract(all_text, pages_text, custom_instructions)
         dtype = result.get('type')
         entities = result.get('entities')
         mapped = result.get('mapped_fields')
@@ -3300,6 +3301,7 @@ def api_extract():
             "pages": len(pages_text),
             "entities": entities,
             "mapped_fields": mapped,
+            "custom_fields": result.get('custom_fields'),  # Add this line
             "validation": validation,
             "confidence": confidence,
             "tables": tables,
@@ -3347,13 +3349,15 @@ def api_extract_async():
         # Read form parameters before starting background thread
         override = (request.form.get('domain_override') or '').strip().lower()
         enrich_flag = (request.form.get('enrich') or '').strip().lower() in ("1","true","yes")
+        custom_instructions = (request.form.get('custom_instructions') or '').strip()
         use_ocr_flag = (request.form.get('use_ocr') or '').strip().lower() in ("1","true","yes")
 
         job_id = str(uuid.uuid4())
         with EXTRACT_JOBS_LOCK:
             EXTRACT_JOBS[job_id] = {"progress": 0, "done": False, "error": None, "result": None}
 
-        def run_job(jid: str, path: str, override: str, enrich_flag: bool, use_ocr_flag: bool):
+        custom_instructions = (request.form.get('custom_instructions') or '').strip()
+        def run_job(jid: str, path: str, override: str, enrich_flag: bool, use_ocr_flag: bool, custom_instructions: str):
             def set_progress(p: int):
                 with EXTRACT_JOBS_LOCK:
                     if jid in EXTRACT_JOBS:
@@ -3410,7 +3414,7 @@ def api_extract_async():
                     from backend.extraction.specialized import Router as ExtractRouter, TableExtractor, FormulaExtractor  # type: ignore
 
                 # AI-only extraction path in async job
-                result = ai_only_extract(all_text, pages_text)
+                result = ai_only_extract(all_text, pages_text, custom_instructions)
                 dtype = result.get('type')
                 entities = result.get('entities')
                 mapped = result.get('mapped_fields')
@@ -3528,6 +3532,7 @@ def api_extract_async():
                     "pages": len(pages_text),
                     "entities": entities,
                     "mapped_fields": mapped,
+                    "custom_instructions_result": result.get('custom_instructions_result'),
                     "validation": validation,
                     "confidence": confidence,
                     "tables": tables,
@@ -3552,7 +3557,7 @@ def api_extract_async():
                 except Exception:
                     pass
 
-        th = threading.Thread(target=run_job, args=(job_id, temp_path, override, enrich_flag, use_ocr_flag), daemon=True)
+        th = threading.Thread(target=run_job, args=(job_id, temp_path, override, enrich_flag, use_ocr_flag, custom_instructions), daemon=True)
         th.start()
         return jsonify({"job_id": job_id})
     except Exception as e:
@@ -3618,9 +3623,10 @@ def api_extract_pdf():
 
         override = (request.form.get('domain_override') or '').strip().lower()
         enrich_flag = (request.form.get('enrich') or '').strip().lower() in ("1","true","yes")
-
+        custom_instructions = (request.form.get('custom_instructions') or '').strip()
+        
         # AI-only extraction for PDF endpoint
-        result = ai_only_extract(all_text, pages_text)
+        result = ai_only_extract(all_text, pages_text, custom_instructions)
         dtype = result.get('type')
         entities = result.get('entities')
         mapped = result.get('mapped_fields')
@@ -3682,6 +3688,29 @@ def api_extract_pdf():
                 elems.append(Paragraph(f"• <b>{k}:</b> {text_value}", meta_style))
             elems.append(Spacer(1, 8))
 
+        # Custom Instructions Result (only if present)
+        cir = result.get('custom_instructions_result') if isinstance(result, dict) else None
+        if cir:
+            elems.append(Paragraph("<b>Custom Instructions Result</b>", styles['Heading3']))
+            try:
+                cir_text = str(cir)
+            except Exception:
+                cir_text = json.dumps(cir, ensure_ascii=False)
+            elems.append(Paragraph(cir_text, meta_style))
+            elems.append(Spacer(1, 8))
+
+        # Custom Fields (only if present)
+        custom_fields = result.get('custom_fields') if isinstance(result, dict) else {}
+        if isinstance(custom_fields, dict) and custom_fields:
+            elems.append(Paragraph("<b>Custom Fields</b>", styles['Heading3']))
+            for ck, cv in custom_fields.items():
+                try:
+                    cv_text = json.dumps(cv, ensure_ascii=False) if isinstance(cv, (dict, list)) else str(cv)
+                except Exception:
+                    cv_text = str(cv)
+                elems.append(Paragraph(f"• <b>{ck}:</b> {cv_text}", meta_style))
+            elems.append(Spacer(1, 8))
+        
         # Enrichment
         enr = (mapped or {}).get("enrichment") or {}
         if enr:
@@ -3758,7 +3787,7 @@ def api_extract_pdf():
 
 # ─────────────────────────────────────────────────────────────────
 
-def ai_only_extract(all_text: str, pages_text: list[str]) -> dict:
+def ai_only_extract(all_text: str, pages_text: list[str], custom_instructions: str = "") -> dict:
     """Run AI-only extraction with a strict, schema-driven prompt to get exact values.
     Returns a full response with keys: type, pages, entities, mapped_fields, validation, confidence, tables, formulas, provenance
     Note: tables/formulas/provenance are left empty in AI-only mode unless we extend the AI prompt.
@@ -3792,7 +3821,8 @@ def ai_only_extract(all_text: str, pages_text: list[str]) -> dict:
         "Then extract the following fields as strict JSON with keys: {\n"
         "  \"type\": string,\n"
         "  \"mapped_fields\": object (domain-specific fields exactly as listed for that type),\n"
-        "  \"entities\": { \"emails\": [], \"phones\": [], \"amounts\": [], \"dates\": [] }\n"
+        "  \"entities\": { \"emails\": [], \"phones\": [], \"amounts\": [], \"dates\": [] },\n"
+        "  \"custom_fields\": object | null  // additional fields requested by custom instructions\n"
         "}\n\n"
         "EXTRACTION RULES:\n"
         "- Use exact values from the text; do not infer new numbers or paraphrase amounts/dates.\n"
@@ -3843,6 +3873,18 @@ def ai_only_extract(all_text: str, pages_text: list[str]) -> dict:
         f"Text (truncated):\n{doc_snippet}\n\n"
         f"Field schema (reference): {json.dumps(schema)}\n"
     )
+    # If custom instructions are provided, require a dedicated field
+    if custom_instructions:
+        prompt += (
+            "\nIMPORTANT: The user provided CUSTOM INSTRUCTIONS below.\n"
+            "DECISION LOGIC:\n"
+            "- If the instruction relates to existing document fields (e.g., 'extract dates in ISO format', 'focus on medication dosages'), modify the relevant mapped_fields accordingly.\n"
+            "- If the instruction asks for different concepts/data types (e.g., 'extract keywords', 'find risk factors', 'identify action items'), create new fields in 'custom_fields'.\n"
+            "- You can do BOTH: modify existing fields AND add custom fields if the instruction covers both.\n"
+            "- Use descriptive snake_case keys for custom_fields (e.g., 'keywords', 'risk_factors', 'action_items').\n"
+            "- If nothing relevant is found, set 'custom_fields' to null.\n\n"
+            f"CUSTOM INSTRUCTIONS:\n{custom_instructions}\n"
+        )
     ai_text = None
     data = {}
     # Thread-based timeout for Windows compatibility
@@ -3883,6 +3925,7 @@ def ai_only_extract(all_text: str, pages_text: list[str]) -> dict:
     # Ensure minimal structure
     entities = data.get('entities') or {}
     mapped = data.get('mapped_fields') or {}
+    custom_result = data.get('custom_instructions_result')
     # Lightweight validation: ensure only schema fields exist
     allowed = set(schema.get(dtype, []))
     mapped_clean = {}
@@ -3900,6 +3943,7 @@ def ai_only_extract(all_text: str, pages_text: list[str]) -> dict:
         "pages": len(pages_text or []),
         "entities": entities,
         "mapped_fields": mapped_clean,
+        "custom_fields": data.get('custom_fields'),  # Add this line
         "validation": {"errors": [], "warnings": []},
         "confidence": confidence,
         "tables": [],
