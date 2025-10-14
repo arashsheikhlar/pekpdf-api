@@ -18,7 +18,7 @@ from flask_cors import CORS                 # allow front-end origin
 from werkzeug.utils import secure_filename
 from PyPDF2 import PdfMerger, PdfReader, PdfWriter   # ← PdfReader/Writer for split
 from datetime import datetime, timedelta
-import mimetypes, os, uuid, io, re
+import mimetypes, os, uuid, io, re, zipfile
 import subprocess, shlex          # run Ghostscript
 import shutil, platform
 from pdf2docx import Converter
@@ -116,6 +116,119 @@ EXTRACT_CACHE_TTL_SECONDS = int(os.getenv("EXTRACT_CACHE_TTL_SECONDS", "86400"))
 EXTRACT_PIPELINE_VERSION = "v3-ai-only"  # bump to invalidate old cache for AI-only pipeline
 
 _OCR_SERVICE = OCRService() if OCRService is not None else None
+
+# ── Extraction Domain Schema (Backend authoritative map) ─────────
+# Each domain maps to a flat list of canonical field keys.
+# UI may present categories/groups, but backend validation uses this flat list.
+DOMAIN_FIELDS: dict[str, list[str]] = {
+    # Core domains (existing + expanded)
+    "invoice": [
+        "invoice_number", "po_number", "invoice_date", "due_date", "currency",
+        "vendor_name", "vendor_address", "vendor_email", "vendor_phone", "vendor_tax_id",
+        "customer_name", "customer_address", "customer_email", "customer_phone", "customer_tax_id",
+        "subtotal_amount", "tax_amount", "tax_rate", "shipping_amount", "discount_amount", "total_amount",
+        "payment_terms", "payment_method", "notes",
+        "line_items"  # list of {description, quantity, unit_price, amount}
+    ],
+    "purchase_order": [
+        "po_number", "requisition_number", "po_date", "delivery_date", "currency",
+        "buyer_name", "buyer_address", "buyer_email", "buyer_phone",
+        "vendor_name", "vendor_address", "vendor_email", "vendor_phone",
+        "ship_to_name", "ship_to_address",
+        "bill_to_name", "bill_to_address",
+        "payment_terms", "approval_status", "approver_name",
+        "subtotal_amount", "tax_amount", "shipping_amount", "discount_amount", "total_amount",
+        "line_items"
+    ],
+    "receipt": [
+        "receipt_number", "receipt_date", "store_name", "store_address", "store_phone",
+        "cashier_name", "payment_method", "currency", "tax_amount", "total_amount",
+        "line_items"
+    ],
+    "contract": [
+        "party_a", "party_b", "effective_date", "term", "termination", "governing_law",
+        "jurisdiction", "payment_terms", "confidentiality", "liability", "indemnity",
+        "contact_email", "signatories"
+    ],
+    "financial": [
+        "statement_type", "period", "currency",
+        "revenue", "cost_of_goods_sold", "gross_profit", "operating_income", "operating_expenses",
+        "net_income", "ebitda", "gross_margin", "operating_margin", "net_margin", "eps",
+        "operating_cash_flow", "free_cash_flow", "total_assets", "total_liabilities",
+        "shareholders_equity", "debt", "cash_and_equivalents", "ratios", "line_items"
+    ],
+    "bank_statement": [
+        "account_holder", "account_number", "statement_period", "opening_balance",
+        "closing_balance", "total_deposits", "total_withdrawals", "fees", "interest",
+        "transactions"  # list of {date, description, debit, credit, balance}
+    ],
+    "tax_form": [
+        "form_type", "tax_year", "filer_name", "filer_ssn_ein", "filer_address",
+        "income_categories", "deductions", "credits", "tax_owed", "refund_amount"
+    ],
+    "research": [
+        "title", "authors", "affiliations", "abstract", "methodology", "results",
+        "conclusions", "keywords", "doi", "citations", "references", "research_metrics"
+    ],
+    "healthcare": [
+        "patient_id", "mrn", "patient_name", "dob", "icd9_codes", "icd10_codes", "cpt_codes",
+        "chief_complaint", "history", "physical_exam", "assessment", "plan",
+        "medications", "allergies", "vitals", "labs", "diagnosis_text", "procedures_text",
+        "primary_contact"
+    ],
+    "resume": [
+        "name", "email", "phone", "address", "linkedin", "portfolio",
+        "summary", "skills_technical", "skills_soft",
+        "experience",  # list of {company, role, start_date, end_date, responsibilities, achievements}
+        "education",   # list of {degree, institution, start_date, end_date, gpa}
+        "certifications", "languages", "publications", "awards"
+    ],
+    "legal_pleading": [
+        "case_name", "court", "docket_number", "judge", "filing_date",
+        "parties", "claims", "relief_requested", "orders"
+    ],
+    "patent": [
+        "patent_number", "application_number", "title", "assignee", "inventors",
+        "filing_date", "issue_date", "ipc_codes", "abstract", "claims", "description"
+    ],
+    "medical_bill": [
+        "provider_name", "provider_address", "patient_name", "patient_id", "service_dates",
+        "icd_codes", "cpt_codes", "charges", "insurance_payments", "patient_responsibility",
+        "total_amount"
+    ],
+    "lab_report": [
+        "patient_name", "patient_id", "collection_date", "report_date", "ordering_physician",
+        "tests",  # list of {name, value, unit, reference_range}
+        "interpretation"
+    ],
+    "insurance_claim": [
+        "claim_number", "policy_number", "insured_name", "loss_date", "loss_description",
+        "adjuster_name", "status", "payments", "total_amount"
+    ],
+    "real_estate": [
+        "property_address", "parcel_number", "owner_name", "assessed_value", "sale_price",
+        "mortgage_lender", "loan_amount", "closing_date", "recording_number"
+    ],
+    "shipping_manifest": [
+        "manifest_number", "carrier", "ship_date", "origin", "destination",
+        "items",  # list of {description, quantity, weight, value}
+        "total_weight", "total_value"
+    ],
+    # Generic fallback
+    "general": [
+        "summary", "emails", "phones", "amounts", "dates"
+    ],
+}
+
+def _normalize_domain(value: str | None) -> str:
+    d = (value or "").strip().lower()
+    return d if d in DOMAIN_FIELDS else ("general" if d == "" else d)
+
+def _validate_selected_fields(domain: str, selected_fields: list[str] | None) -> list[str]:
+    allowed = set(DOMAIN_FIELDS.get(domain, []))
+    if not selected_fields:
+        return list(allowed)
+    return [f for f in selected_fields if f in allowed]
 
 def build_inverted_index(pages_text: list[str]) -> dict[str, list[int]]:
     """Very simple inverted index: word (>=4 chars) -> sorted list of page numbers (1-indexed)."""
@@ -3348,6 +3461,13 @@ def api_extract_async():
 
         # Read form parameters before starting background thread
         override = (request.form.get('domain_override') or '').strip().lower()
+        # Optional explicit field selection (JSON array)
+        try:
+            selected_fields = json.loads(request.form.get('selected_fields') or '[]')
+            if not isinstance(selected_fields, list):
+                selected_fields = []
+        except Exception:
+            selected_fields = []
         enrich_flag = (request.form.get('enrich') or '').strip().lower() in ("1","true","yes")
         custom_instructions = (request.form.get('custom_instructions') or '').strip()
         use_ocr_flag = (request.form.get('use_ocr') or '').strip().lower() in ("1","true","yes")
@@ -3357,7 +3477,7 @@ def api_extract_async():
             EXTRACT_JOBS[job_id] = {"progress": 0, "done": False, "error": None, "result": None}
 
         custom_instructions = (request.form.get('custom_instructions') or '').strip()
-        def run_job(jid: str, path: str, override: str, enrich_flag: bool, use_ocr_flag: bool, custom_instructions: str):
+        def run_job(jid: str, path: str, override: str, enrich_flag: bool, use_ocr_flag: bool, custom_instructions: str, selected_fields_param: list[str]):
             def set_progress(p: int):
                 with EXTRACT_JOBS_LOCK:
                     if jid in EXTRACT_JOBS:
@@ -3413,8 +3533,10 @@ def api_extract_async():
                     from backend.extraction.pipeline import DocumentTypeDetector, BasicExtractor, DomainFieldMapper, Validator, ConfidenceScorer  # type: ignore
                     from backend.extraction.specialized import Router as ExtractRouter, TableExtractor, FormulaExtractor  # type: ignore
 
-                # AI-only extraction path in async job
-                result = ai_only_extract(all_text, pages_text, custom_instructions)
+                # AI-only extraction path in async job (domain-focused if provided)
+                domain_for_job = _normalize_domain(override)
+                selected_valid = _validate_selected_fields(domain_for_job, selected_fields_param)
+                result = ai_only_extract(all_text, pages_text, custom_instructions, domain_for_job, selected_valid)
                 dtype = result.get('type')
                 entities = result.get('entities')
                 mapped = result.get('mapped_fields')
@@ -3557,7 +3679,7 @@ def api_extract_async():
                 except Exception:
                     pass
 
-        th = threading.Thread(target=run_job, args=(job_id, temp_path, override, enrich_flag, use_ocr_flag, custom_instructions), daemon=True)
+        th = threading.Thread(target=run_job, args=(job_id, temp_path, override, enrich_flag, use_ocr_flag, custom_instructions, selected_fields), daemon=True)
         th.start()
         return jsonify({"job_id": job_id})
     except Exception as e:
@@ -3576,6 +3698,156 @@ def api_extract_status(job_id: str):
             "error": job.get("error"),
             "result": job.get("result") if job.get("done") else None,
         })
+
+# ── Batch extraction (multiple PDFs) ───────────────────────────────
+@app.post("/api/extract/batch")
+def api_extract_batch_start():
+    try:
+        files = request.files.getlist('files') or []
+        if not files:
+            return jsonify({"error": "No files provided"}), 400
+        domain = (request.form.get('domain') or '').strip().lower()
+        try:
+            selected_fields = json.loads(request.form.get('selected_fields') or '[]')
+            if not isinstance(selected_fields, list):
+                selected_fields = []
+        except Exception:
+            selected_fields = []
+        use_ocr_flag = (request.form.get('use_ocr') or '').strip().lower() in ("1","true","yes")
+        custom_instructions = (request.form.get('custom_instructions') or '').strip()
+
+        batch_id = str(uuid.uuid4())
+        with EXTRACT_JOBS_LOCK:
+            EXTRACT_JOBS[batch_id] = {"progress": 0, "done": False, "error": None, "result": None, "is_batch": True, "items": []}
+
+        saved_paths: list[tuple[str, str]] = []  # (orig_name, saved_path)
+        for f in files:
+            if not f.filename:
+                continue
+            if not allowed_pdf(f):
+                continue
+            fname = secure_filename(f.filename) or f"upload_{uuid.uuid4()}.pdf"
+            temp_path = os.path.join(app.config["UPLOAD_FOLDER"], f"{uuid.uuid4()}_{fname}")
+            f.save(temp_path)
+            saved_paths.append((fname, temp_path))
+
+        def run_batch(bid: str, items: list[tuple[str, str]], domain: str, selected_fields: list[str], use_ocr_flag: bool, custom_instructions: str):
+            try:
+                total = max(1, len(items))
+                out_results = []
+                for idx, (orig, path) in enumerate(items, start=1):
+                    try:
+                        # Per-file extract
+                        pages_text = []
+                        if use_ocr_flag and _OCR_SERVICE is not None:
+                            try:
+                                ocr_result = _OCR_SERVICE.hybrid_extraction(path)
+                                if ocr_result.get('success'):
+                                    pages_text = [p.get('text') or "" for p in (ocr_result.get('pages') or [])]
+                                else:
+                                    reader = PdfReader(path)
+                                    for p in reader.pages:
+                                        try:
+                                            pages_text.append(p.extract_text() or "")
+                                        except Exception:
+                                            pages_text.append("")
+                            except Exception:
+                                reader = PdfReader(path)
+                                for p in reader.pages:
+                                    try:
+                                        pages_text.append(p.extract_text() or "")
+                                    except Exception:
+                                        pages_text.append("")
+                        else:
+                            reader = PdfReader(path)
+                            try:
+                                from concurrent.futures import ThreadPoolExecutor
+                                def _extract_page(i):
+                                    try:
+                                        return reader.pages[i].extract_text() or ""
+                                    except Exception:
+                                        return ""
+                                with ThreadPoolExecutor(max_workers=4) as ex:
+                                    pages_text = list(ex.map(_extract_page, range(len(reader.pages))))
+                            except Exception:
+                                pages_text = []
+                                for p in reader.pages:
+                                    try:
+                                        pages_text.append(p.extract_text() or "")
+                                    except Exception:
+                                        pages_text.append("")
+                        all_text = "\n".join(pages_text)
+                        domain_norm = _normalize_domain(domain)
+                        selected_valid = _validate_selected_fields(domain_norm, selected_fields)
+                        result = ai_only_extract(all_text, pages_text, custom_instructions, domain_norm, selected_valid)
+                        out_results.append({"file": orig, "result": result})
+                    except Exception as fe:
+                        out_results.append({"file": orig, "error": str(fe)})
+                    finally:
+                        try:
+                            if os.path.isfile(path):
+                                os.remove(path)
+                        except Exception:
+                            pass
+                    with EXTRACT_JOBS_LOCK:
+                        if bid in EXTRACT_JOBS:
+                            EXTRACT_JOBS[bid]["progress"] = int(idx * 100 / total)
+                            EXTRACT_JOBS[bid]["items"] = out_results
+                with EXTRACT_JOBS_LOCK:
+                    if bid in EXTRACT_JOBS:
+                        EXTRACT_JOBS[bid]["done"] = True
+                        EXTRACT_JOBS[bid]["result"] = {"items": out_results}
+                        EXTRACT_JOBS[bid]["progress"] = 100
+            except Exception as e:
+                with EXTRACT_JOBS_LOCK:
+                    if bid in EXTRACT_JOBS:
+                        EXTRACT_JOBS[bid]["error"] = str(e)
+                        EXTRACT_JOBS[bid]["done"] = True
+                        EXTRACT_JOBS[bid]["progress"] = 100
+
+        th = threading.Thread(target=run_batch, args=(batch_id, saved_paths, domain, selected_fields, use_ocr_flag, custom_instructions), daemon=True)
+        th.start()
+        return jsonify({"batch_id": batch_id})
+    except Exception as e:
+        return jsonify({"error": f"Failed to start batch: {e}"}), 500
+
+@app.get("/api/extract/batch/status/<batch_id>")
+def api_extract_batch_status(batch_id: str):
+    with EXTRACT_JOBS_LOCK:
+        job = EXTRACT_JOBS.get(batch_id)
+        if not job:
+            return jsonify({"error": "not_found"}), 404
+        if not job.get("is_batch"):
+            return jsonify({"error": "not_a_batch"}), 400
+        return jsonify({
+            "batch_id": batch_id,
+            "progress": job.get("progress", 0),
+            "done": job.get("done", False),
+            "error": job.get("error"),
+            "items": job.get("result", {}).get("items") if job.get("done") else (job.get("items") or []),
+        })
+
+@app.get("/api/extract/batch/results/<batch_id>")
+def api_extract_batch_results(batch_id: str):
+    with EXTRACT_JOBS_LOCK:
+        job = EXTRACT_JOBS.get(batch_id)
+        if not job:
+            return jsonify({"error": "not_found"}), 404
+        if not job.get("is_batch"):
+            return jsonify({"error": "not_a_batch"}), 400
+        if not job.get("done"):
+            return jsonify({"error": "not_ready"}), 400
+        items = (job.get("result") or {}).get("items") or []
+    # Build a ZIP of JSON files
+    mem = io.BytesIO()
+    with zipfile.ZipFile(mem, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
+        for it in items:
+            name = (it.get('file') or f"file_{uuid.uuid4()}")
+            safe = re.sub(r"[^A-Za-z0-9_.-]", "_", name)
+            content = json.dumps(it, ensure_ascii=False, indent=2)
+            zf.writestr(f"{safe}.json", content)
+    mem.seek(0)
+    return send_file(mem, mimetype='application/zip', as_attachment=True, download_name=f"extract_batch_{batch_id}.zip")
 
 @app.post("/api/extract/pdf")
 def api_extract_pdf():
@@ -3622,11 +3894,20 @@ def api_extract_pdf():
             from backend.extraction.specialized import Router as ExtractRouter, TableExtractor, FormulaExtractor  # type: ignore
 
         override = (request.form.get('domain_override') or '').strip().lower()
+        # Optional selected fields for focused PDF rendering
+        try:
+            selected_fields = json.loads(request.form.get('selected_fields') or '[]')
+            if not isinstance(selected_fields, list):
+                selected_fields = []
+        except Exception:
+            selected_fields = []
         enrich_flag = (request.form.get('enrich') or '').strip().lower() in ("1","true","yes")
         custom_instructions = (request.form.get('custom_instructions') or '').strip()
         
-        # AI-only extraction for PDF endpoint
-        result = ai_only_extract(all_text, pages_text, custom_instructions)
+        # AI-only extraction for PDF endpoint (honor domain/fields if provided)
+        domain_for_pdf = _normalize_domain(override)
+        selected_valid = _validate_selected_fields(domain_for_pdf, selected_fields)
+        result = ai_only_extract(all_text, pages_text, custom_instructions, domain_for_pdf, selected_valid)
         dtype = result.get('type')
         entities = result.get('entities')
         mapped = result.get('mapped_fields')
@@ -3787,7 +4068,7 @@ def api_extract_pdf():
 
 # ─────────────────────────────────────────────────────────────────
 
-def ai_only_extract(all_text: str, pages_text: list[str], custom_instructions: str = "") -> dict:
+def ai_only_extract(all_text: str, pages_text: list[str], custom_instructions: str = "", domain: str | None = None, selected_fields: list[str] | None = None) -> dict:
     """Run AI-only extraction with a strict, schema-driven prompt to get exact values.
     Returns a full response with keys: type, pages, entities, mapped_fields, validation, confidence, tables, formulas, provenance
     Note: tables/formulas/provenance are left empty in AI-only mode unless we extend the AI prompt.
@@ -3807,72 +4088,38 @@ def ai_only_extract(all_text: str, pages_text: list[str], custom_instructions: s
         "Extract exact values from the text without paraphrasing, keep original formatting of numbers and dates where possible. "
         "Use null for missing fields."
     )
-    schema = {
-        "invoice": ["invoice_number", "po_number", "due_date", "total_amount", "subtotal_amount", "tax_amount", "vendor_email"],
-        "contract": ["party_a", "party_b", "governing_law", "term", "contact_email"],
-        "financial": ["statement_type", "period", "currency", "revenue", "cost_of_goods_sold", "gross_profit", "operating_income", "operating_expenses", "net_income", "ebitda", "gross_margin", "operating_margin", "net_margin", "eps", "operating_cash_flow", "free_cash_flow", "total_assets", "total_liabilities", "shareholders_equity", "debt", "cash_and_equivalents", "line_items", "ratios"],
-        "research": ["doi", "citations", "authors", "affiliations", "abstract", "methodology", "results", "conclusions", "references", "research_metrics"],
-        "healthcare": ["patient_id", "mrn", "icd9_codes", "icd10_codes", "cpt_codes", "chief_complaint", "history", "physical_exam", "assessment", "plan", "medications", "allergies", "vitals", "labs", "diagnosis_text", "procedures_text", "primary_contact"],
-        "general": ["summary", "emails", "phones", "amounts", "dates"],
-    }
-    # Ask AI to first detect type, then extract fields for that type.
-    prompt = (
-        "Detect document type as one of: invoice, contract, financial, research, healthcare, general.\n"
-        "Then extract the following fields as strict JSON with keys: {\n"
-        "  \"type\": string,\n"
-        "  \"mapped_fields\": object (domain-specific fields exactly as listed for that type),\n"
-        "  \"entities\": { \"emails\": [], \"phones\": [], \"amounts\": [], \"dates\": [] },\n"
-        "  \"custom_fields\": object | null  // additional fields requested by custom instructions\n"
-        "}\n\n"
-        "EXTRACTION RULES:\n"
-        "- Use exact values from the text; do not infer new numbers or paraphrase amounts/dates.\n"
-        "- Preserve formatting for numbers and dates where present.\n"
-        "- If a field is not present, set it to null (or [] for arrays).\n"
-        "- Do not include any keys not listed.\n"
-        "- Return ONLY JSON.\n\n"
-        "INVOICE-SPECIFIC GUIDANCE:\n"
-        "- Invoice number: Look for labels like 'Invoice No.', 'Invoice Number' and extract the exact code following the label\n"
-        "- PO number: Look for 'PO No.' or 'PO Number'\n"
-        "- Due date: Use the date next to 'Due Date'\n"
-        "- Amounts: Prefer values next to 'Total', 'Subtotal', 'Tax'; preserve currency symbols/codes and separators\n"
-        "- Vendor email: Choose a plausible email from the document (e.g., near header/footer/contact)\n\n"
-        "CONTRACT-SPECIFIC GUIDANCE:\n"
-        "- Parties: 'between <Party A> and <Party B>' or 'by and between'—extract exact party names\n"
-        "- Governing law: Look for 'governing law of <Jurisdiction>'\n"
-        "- Term: Durations like '12 months', '3 years' (keep original formatting)\n"
-        "- Contact email: Choose an email near notice or signature sections\n\n"
-        "FINANCIAL-SPECIFIC GUIDANCE:\n"
-        "- Identify statement type: income statement, balance sheet, cash flow\n"
-        "- Period: quarter/year (e.g., Q1 2024, FY 2023); keep exactly as written\n"
-        "- Currency: USD/EUR/GBP or symbol; preserve code/symbol and formatting\n"
-        "- Extract key fields: revenue, cost of goods sold, gross profit, operating income, operating expenses, net income, EBITDA\n"
-        "- Margins/ratios: gross/operating/net margin (%), EPS; list under ratios\n"
-        "- Cash flow: operating cash flow, free cash flow; keep signs and units\n"
-        "- Balance sheet: total assets, total liabilities, shareholders' equity, debt, cash and equivalents\n"
-        "- Line items: include a list of {name, value} for other financial lines\n\n"
-        "RESEARCH-SPECIFIC GUIDANCE:\n"
-        "- Abstract: Look for 'Abstract' section or first paragraph after title\n"
-        "- Methodology: Find 'Methods', 'Methodology', or 'Materials and Methods' sections\n"
-        "- Results: Look for 'Results' or 'Findings' sections\n"
-        "- Conclusions: Find 'Conclusion', 'Discussion', or 'Summary' sections\n"
-        "- DOI: Look for '10.' followed by numbers and slashes (e.g., 10.1038/nature12345)\n"
-        "- Citations: Extract author names with 'et al.' and years in parentheses\n"
-        "- Research metrics: Extract as object with keys: p_values, sample_sizes, confidence_intervals, effect_sizes, means_sd, percentages\n"
-        "- Authors: Extract from title area or author list\n"
-        "- Affiliations: Find university, institute, or organization names\n\n"
-        "HEALTHCARE-SPECIFIC GUIDANCE:\n"
-        "- Patient identifiers: 'Patient ID', 'MRN'—extract exact codes\n"
-        "- Codes: ICD-9/ICD-10 codes (e.g., 'E11.9'), CPT 5-digit codes\n"
-        "- Sections: Chief Complaint, History, Physical Exam, Assessment, Plan\n"
-        "- Medications: Parse 'Name: <dose> <frequency>' lines into objects\n"
-        "- Vitals: BP, HR, RR, Temp, O2—preserve units and formatting\n"
-        "- Labs: Extract as objects {name, value, unit} from lab sections\n\n"
-        "GENERAL-SPECIFIC GUIDANCE:\n"
-        "- Summary: 1-3 sentence summary of document\n"
-        "- Entities: Extract any emails, phones, amounts, and dates present anywhere\n\n"
-        f"Text (truncated):\n{doc_snippet}\n\n"
-        f"Field schema (reference): {json.dumps(schema)}\n"
-    )
+    # If a domain is provided, use focused schema and instructions; else provide compact detection prompt.
+    domain_norm = _normalize_domain(domain)
+    allowed_fields = DOMAIN_FIELDS.get(domain_norm, DOMAIN_FIELDS["general"]) if domain_norm else DOMAIN_FIELDS["general"]
+    selected = _validate_selected_fields(domain_norm, selected_fields) if domain_norm else []
+    if domain_norm and domain_norm in DOMAIN_FIELDS:
+        fields_for_prompt = selected if selected else allowed_fields
+        prompt = (
+            f"Document domain: {domain_norm}. Extract ONLY the following fields under 'mapped_fields': {json.dumps(fields_for_prompt)}\n"
+            "Return JSON with keys: {\n"
+            "  \"type\": string (exactly the provided domain),\n"
+            "  \"mapped_fields\": object (only the requested fields),\n"
+            "  \"entities\": { \"emails\": [], \"phones\": [], \"amounts\": [], \"dates\": [] },\n"
+            "  \"custom_fields\": object | null\n"
+            "}\n\n"
+            "Rules: Use exact values from text; preserve number/date formatting; missing => null (or [] for arrays).\n"
+            "Do not include extraneous keys. Return ONLY JSON.\n\n"
+            f"Text (truncated):\n{doc_snippet}\n"
+        )
+    else:
+        # Compact auto-detect fallback (legacy behavior)
+        compact_schema = {k: DOMAIN_FIELDS[k][:8] for k in ("invoice","contract","financial","research","healthcare","general") if k in DOMAIN_FIELDS}
+        prompt = (
+            "Detect document type as one of: invoice, contract, financial, research, healthcare, general.\n"
+            "Then extract fields (limited set) as strict JSON with keys: {\n"
+            "  \"type\": string,\n"
+            "  \"mapped_fields\": object,\n"
+            "  \"entities\": { \"emails\": [], \"phones\": [], \"amounts\": [], \"dates\": [] },\n"
+            "  \"custom_fields\": object | null\n"
+            "}\n\n"
+            f"Text (truncated):\n{doc_snippet}\n\n"
+            f"Field schema (reference): {json.dumps(compact_schema)}\n"
+        )
     # If custom instructions are provided, require a dedicated field
     if custom_instructions:
         prompt += (
@@ -3921,13 +4168,21 @@ def ai_only_extract(all_text: str, pages_text: list[str], custom_instructions: s
             data = {}
     if not isinstance(data, dict):
         data = {}
-    dtype = (data.get('type') or 'general').lower()
+    dtype = (data.get('type') or (domain_norm or 'general')).lower()
     # Ensure minimal structure
     entities = data.get('entities') or {}
     mapped = data.get('mapped_fields') or {}
     custom_result = data.get('custom_instructions_result')
     # Lightweight validation: ensure only schema fields exist
-    allowed = set(schema.get(dtype, []))
+    # If user selected specific fields, only include those; otherwise use domain's allowed fields
+    if selected and domain_norm:
+        # User selected specific fields - only include those
+        allowed = set(selected)
+    else:
+        # No specific selection - use domain's allowed fields
+        filter_domain = domain_norm or dtype
+        allowed = set(DOMAIN_FIELDS.get(filter_domain, DOMAIN_FIELDS["general"]))
+    
     mapped_clean = {}
     for k, v in (mapped.items() if isinstance(mapped, dict) else []):
         if k in allowed:
