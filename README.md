@@ -80,14 +80,100 @@ A web-based PDF toolbox that provides various PDF manipulation and conversion to
 
 ## Extraction
 
-Current extraction is AI-only and schema-driven. The classic heuristic pipeline and specialized table/formula extractors were removed for simplicity and maintainability. OCR remains available in the async extraction endpoint via `OCRService`.
+The extraction system has been completely refactored into a modular, scalable architecture with clear separation of concerns.
 
-- Sync `/api/extract`: reads native PDF text, accepts `domain_override` and optional `custom_instructions`, and calls the AI extractor. Confidence is computed with `ConfidenceScorer`.
-- Async `/api/extract/async`: supports an optional `use_ocr=1` flag; when enabled, uses a hybrid native-text + OCR flow before AI extraction. Confidence is computed with `ConfidenceScorer`.
+### Architecture Overview
 
-Notes:
-- `extraction/confidence.py` exports `ConfidenceScorer`.
-- `extraction/specialized.py` was removed (no tables/formulas wiring at this time).
+The extraction system uses a pipeline-based architecture with the following components:
+
+- **Pipeline**: Main orchestration (`ExtractionPipeline`) that coordinates all services
+- **Services**: Domain, AI, Text, Cache services for specific functionality
+- **Models**: Pydantic models for type safety and validation
+- **Plugins**: Extensible plugin system for additional extraction capabilities
+- **Configuration**: Centralized configuration management
+
+### Core Services
+
+- **Domain Service**: Manages document types and field schemas
+- **AI Service**: Handles AI provider integration (Ollama, OpenAI, Anthropic)
+- **Text Service**: PDF text extraction with OCR fallback
+- **Cache Service**: Memory and disk caching for performance
+- **Confidence Scorer**: Computes confidence scores for extracted fields
+
+### Plugin System
+
+The system includes a plugin architecture for extensibility:
+
+- **Table Extractor**: Extracts tables from PDFs (placeholder for pdfplumber integration)
+- **Formula Extractor**: Extracts mathematical formulas and equations
+- **Custom Plugins**: Easy to add new extraction capabilities
+
+### API Endpoints
+
+- **Sync `/api/extract`**: Uses the new pipeline architecture with caching and plugin support
+- **Async `/api/extract/async`**: Supports OCR via `use_ocr=1` flag
+- **Batch `/api/extract/batch`**: Batch processing with pipeline integration
+- **PDF Report `/api/extract/pdf`**: Generates PDF reports with extracted data
+
+### Configuration
+
+The system supports extensive configuration via environment variables:
+
+```bash
+# Cache settings
+EXTRACTION_CACHE_TTL_SECONDS=86400
+EXTRACTION_CACHE_ENABLED=true
+
+# AI settings
+EXTRACTION_AI_SERVICE=ollama
+EXTRACTION_AI_TIMEOUT=180
+EXTRACTION_MAX_TEXT_LENGTH=20000
+
+# Plugin settings
+EXTRACTION_PLUGINS_ENABLED=true
+```
+
+### Document Types
+
+Supports various document types with specific field schemas:
+
+- **Invoice**: `invoice_number`, `total_amount`, `vendor_name`, etc.
+- **Research**: `title`, `authors`, `abstract`, `methodology`, etc.
+- **Healthcare**: `patient_id`, `mrn`, `chief_complaint`, etc.
+- **Contract**: `party_a`, `party_b`, `effective_date`, etc.
+- **Financial**: `statement_type`, `revenue`, `net_income`, etc.
+
+### Usage Example
+
+```python
+from extraction.pipeline import ExtractionPipeline
+from extraction.models import ExtractionOptions
+
+# Configure extraction
+options = ExtractionOptions(
+    domain_override="invoice",
+    selected_fields=["invoice_number", "total_amount"],
+    enrich=True
+)
+
+# Extract from PDF
+result = pipeline.extract("document.pdf", options)
+```
+
+### Testing
+
+The extraction module includes comprehensive tests:
+
+```bash
+# Run all tests
+pytest tests/
+
+# Run specific modules
+pytest tests/test_models.py
+pytest tests/test_domain_service.py
+```
+
+For detailed documentation, see [extraction/README.md](extraction/README.md).
 
 ## License
 

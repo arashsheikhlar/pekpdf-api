@@ -1,13 +1,34 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
-from typing import Dict, Any
+"""
+Confidence scoring service for extraction results.
+
+This module provides confidence scoring for extracted fields based on patterns,
+validation results, and field-specific heuristics.
+"""
+
+from typing import Dict, Any, Optional
 import re
 
 
 class ConfidenceScorer:
-    """Compute simple confidence scores (0-100) for mapped fields based on patterns and validation."""
+    """
+    Compute simple confidence scores (0-100) for mapped fields based on patterns and validation.
+    
+    This class provides domain-specific confidence scoring for extracted fields,
+    taking into account validation results, field patterns, and data quality indicators.
+    """
 
     def _score_amount(self, s: str) -> int:
+        """
+        Score confidence for amount fields based on numeric patterns.
+        
+        Args:
+            s: String value to score
+            
+        Returns:
+            Confidence score (0-100)
+        """
         if not s:
             return 0
         m = re.search(r"([\d,]+\.?\d*)", s)
@@ -20,12 +41,44 @@ class ConfidenceScorer:
             return 50
 
     def _has_currency(self, s: str) -> bool:
+        """
+        Check if a string contains currency symbols or codes.
+        
+        Args:
+            s: String to check
+            
+        Returns:
+            True if currency symbols/codes are found
+        """
         return bool(re.search(r"USD|EUR|GBP|CAD|AUD|CHF|JPY|INR|[$€£]", s or '', flags=re.IGNORECASE))
 
     def _is_iso_date(self, s: str) -> bool:
+        """
+        Check if a string is in ISO date format (YYYY-MM-DD).
+        
+        Args:
+            s: String to check
+            
+        Returns:
+            True if string matches ISO date format
+        """
         return bool(re.search(r"^\d{4}-\d{2}-\d{2}$", s or ''))
 
-    def score(self, dtype: str, mapped: Dict[str, Any], entities: Dict[str, Any], validation: Dict[str, Any], provenance: Dict[str, Any] | None = None, selected_fields: list[str] | None = None) -> Dict[str, Any]:
+    def score(self, dtype: str, mapped: Dict[str, Any], entities: Dict[str, Any], validation: Dict[str, Any], provenance: Optional[Dict[str, Any]] = None, selected_fields: Optional[list[str]] = None) -> Dict[str, Any]:
+        """
+        Compute confidence scores for extracted fields.
+        
+        Args:
+            dtype: Document type
+            mapped: Mapped fields dictionary
+            entities: Extracted entities dictionary
+            validation: Validation results dictionary
+            provenance: Optional provenance information
+            selected_fields: Optional list of fields to score (if None, scores all fields)
+            
+        Returns:
+            Dictionary containing overall confidence and field-specific scores
+        """
         dtype = (dtype or 'general').lower()
         fields: Dict[str, int] = {}
 

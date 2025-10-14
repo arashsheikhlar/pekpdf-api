@@ -57,6 +57,27 @@ try:
 except Exception:
     OCRService = None  # type: ignore
 
+# Import extraction services
+try:
+    from extraction.domain_service import DomainService
+    from extraction.ai_service import AIExtractionService
+    from extraction.text_service import TextExtractionService
+    from extraction.cache_service import CacheService
+    from extraction.confidence import ConfidenceScorer
+    from extraction.pipeline import ExtractionPipeline
+    from extraction.models import ExtractionOptions
+    from extraction.config import config
+except Exception as e:
+    print(f"Warning: Failed to import extraction services: {e}")
+    DomainService = None
+    AIExtractionService = None
+    TextExtractionService = None
+    CacheService = None
+    ConfidenceScorer = None
+    ExtractionPipeline = None
+    ExtractionOptions = None
+    config = None
+
 # Load environment variables from .env file
 load_dotenv()
 
@@ -705,6 +726,54 @@ def normalize_ai_explain_payload(payload):
 app = Flask(__name__)
 app.config["UPLOAD_FOLDER"] = "temp"
 os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
+
+# Initialize extraction services
+_extraction_pipeline = None
+print("DEBUG: Starting extraction services initialization...")
+print(f"DEBUG: DomainService available: {DomainService is not None}")
+print(f"DEBUG: AIExtractionService available: {AIExtractionService is not None}")
+print(f"DEBUG: TextExtractionService available: {TextExtractionService is not None}")
+print(f"DEBUG: CacheService available: {CacheService is not None}")
+print(f"DEBUG: ConfidenceScorer available: {ConfidenceScorer is not None}")
+print(f"DEBUG: ExtractionPipeline available: {ExtractionPipeline is not None}")
+
+if all([DomainService, AIExtractionService, TextExtractionService, CacheService, ConfidenceScorer, ExtractionPipeline]):
+    try:
+        print("DEBUG: Creating service instances...")
+        # Create service instances
+        domain_service = DomainService()
+        print("DEBUG: DomainService created")
+        
+        ai_service = AIExtractionService(domain_service)
+        print("DEBUG: AIExtractionService created")
+        
+        text_service = TextExtractionService(_OCR_SERVICE)
+        print("DEBUG: TextExtractionService created")
+        
+        cache_service = CacheService()
+        print("DEBUG: CacheService created")
+        
+        confidence_scorer = ConfidenceScorer()
+        print("DEBUG: ConfidenceScorer created")
+        
+        # Create pipeline
+        _extraction_pipeline = ExtractionPipeline(
+            domain_service=domain_service,
+            ai_service=ai_service,
+            text_service=text_service,
+            cache_service=cache_service,
+            confidence_scorer=confidence_scorer
+        )
+        print("DEBUG: ExtractionPipeline created")
+        
+        print("Extraction services initialized successfully")
+    except Exception as e:
+        print(f"Warning: Failed to initialize extraction services: {e}")
+        import traceback
+        traceback.print_exc()
+        _extraction_pipeline = None
+else:
+    print("Warning: Some extraction services are not available")
 
 origins = [
     "http://localhost:5173",  # Development frontend
@@ -3177,79 +3246,13 @@ def ai_document_synthesis():
     except Exception as e:
         return jsonify({"error": f"Synthesis failed: {str(e)}"}), 500
 
-@app.post("/api/extract")
-def api_extract():
-    """MVP extraction endpoint: returns detected document type and basic entities.
-    Input: multipart/form-data with 'file' (PDF)
-    Output: { type, pages, entities: { emails, phones, amounts, dates } }
-    """
+def _fallback_extract(temp_path: str, options: ExtractionOptions) -> dict:
+    """Fallback extraction logic when new pipeline is not available."""
     try:
-        if "file" not in request.files:
-            return jsonify({"error": "No file provided"}), 400
-        file = request.files["file"]
-        if file.filename == "":
-            return jsonify({"error": "No file selected"}), 400
-        if not allowed_pdf(file):
-            return jsonify({"error": "Invalid file type. Only PDF files are allowed."}), 400
-
-        # Persist to temp path for specialized extractors
-        fname = secure_filename(file.filename) or f"upload_{uuid.uuid4()}.pdf"
-        temp_path = os.path.join(app.config["UPLOAD_FOLDER"], f"{uuid.uuid4()}_{fname}")
-        file_bytes = file.read()
-        # Include pipeline version and options in cache key to avoid stale mismatches
-        options_identity = json.dumps({
-            "v": EXTRACT_PIPELINE_VERSION,
-            "domain_override": (request.form.get('domain_override') or '').strip().lower(),
-            "force_tables": (request.form.get('force_tables') or '').strip().lower(),
-            "force_formulas": (request.form.get('force_formulas') or '').strip().lower(),
-            "enrich": (request.form.get('enrich') or '').strip().lower(),
-            "use_ocr": (request.form.get('use_ocr') or '').strip().lower(),
-        }, sort_keys=True)
-        file_hash = hashlib.md5(file_bytes + b"|" + options_identity.encode("utf-8")).hexdigest()
-        # Write file to disk for downstream processors
-        with open(temp_path, 'wb') as f:
-            f.write(file_bytes)
-
-        # Serve from cache if available (no domain_override, no force flags)
-        if not request.form.get('domain_override') and not request.form.get('force_tables') and not request.form.get('force_formulas'):
-            # memory cache
-            cached = EXTRACT_CACHE.get(file_hash)
-            if cached:
-                @after_this_request
-                def _cleanup_cached(resp):
-                    try:
-                        if os.path.isfile(temp_path):
-                            os.remove(temp_path)
-                    except Exception:
-                        pass
-                    return resp
-                return jsonify(cached)
-            # disk cache
-            disk_path = _extract_cache_path(file_hash)
-            try:
-                if os.path.isfile(disk_path):
-                    age = time.time() - os.path.getmtime(disk_path)
-                    if age <= EXTRACT_CACHE_TTL_SECONDS:
-                        with open(disk_path, 'r', encoding='utf-8') as fh:
-                            cached_json = json.load(fh)
-                        EXTRACT_CACHE[file_hash] = cached_json
-                        @after_this_request
-                        def _cleanup_cached(resp):
-                            try:
-                                if os.path.isfile(temp_path):
-                                    os.remove(temp_path)
-                            except Exception:
-                                pass
-                            return resp
-                        return jsonify(cached_json)
-            except Exception:
-                pass
-
-        # Read PDF text quickly
+        # Read PDF text
         reader = PdfReader(temp_path)
         pages_text = []
         try:
-            # Parallelize page text extraction
             from concurrent.futures import ThreadPoolExecutor
             def _extract_page(i):
                 try:
@@ -3265,158 +3268,74 @@ def api_extract():
                     pages_text.append(p.extract_text() or "")
                 except Exception:
                     pages_text.append("")
+        
         all_text = "\n".join(pages_text)
-        inv_index = build_inverted_index(pages_text)
-
-        # Use modular extraction pipeline
-        try:
-            from extraction.confidence import ConfidenceScorer
-        except Exception:
-            from backend.extraction.confidence import ConfidenceScorer  # type: ignore
-
-        # Allow client to override detected type
-        override = (request.form.get('domain_override') or '').strip().lower()
-        # AI-only extraction path
-        custom_instructions = (request.form.get('custom_instructions') or '').strip()
+        
+        # Use old extraction logic
+        override = options.domain_override or ''
+        custom_instructions = options.custom_instructions or ''
         domain_norm = _normalize_domain(override)
-        selected_fields = _validate_selected_fields(domain_norm, [])
+        selected_fields = _validate_selected_fields(domain_norm, options.selected_fields)
         result = ai_only_extract(all_text, pages_text, custom_instructions, domain_norm, selected_fields)
-        dtype = result.get('type')
-        entities = result.get('entities')
-        mapped = result.get('mapped_fields')
-        validation = result.get('validation')
-        confidence = result.get('confidence')
-        tables = result.get('tables')
-        formulas = result.get('formulas')
-        provenance = result.get('provenance')
-
-        # Provenance mapping for research documents (skip or keep minimal in AI-only mode)
-        if dtype == 'research' and provenance is None:
-            def pages_for_heading_variants(variants):
-                found_pages = []
-                for idx, txt in enumerate(pages_text):
-                    for h in variants:
-                        try:
-                            if re.search(rf"(?mi)^\s*(?:\d+\.?\s*)?{re.escape(h)}\s*:?\s*$", txt):
-                                found_pages.append(idx + 1)
-                                break
-                        except Exception:
-                            continue
-                return sorted(list({p for p in found_pages}))[:10]
-
-            def pages_for_value(value: str, max_hits: int = 5):
-                if not value:
-                    return []
-                pages: list[int] = []
-                try:
-                    tokens = re.findall(r"[A-Za-z][A-Za-z0-9\-]{3,}", value.lower())
-                    candidates: set[int] = set()
-                    for t in tokens[:3]:  # first few informative tokens
-                        for p in inv_index.get(t, []):
-                            candidates.add(p)
-                    for p in sorted(candidates) or range(1, len(pages_text)+1):
-                        txt = pages_text[p-1]
-                        if not txt:
-                            continue
-                        if re.search(re.escape(value.strip()), txt, flags=re.IGNORECASE):
-                            pages.append(p)
-                            if len(pages) >= max_hits:
-                                break
-                except Exception:
-                    pass
-                return pages
-
-            def entries_with_pages(values: list[str]):
-                out = []
-                for v in values or []:
-                    out.append({"value": v, "pages": pages_for_value(v)})
-                return out
-
-            sections = {}
-            # Section heading variants (mirror of mapper)
-            ABSTRACT = ["abstract"]
-            METHODS = ["methods", "method", "methodology", "materials and methods", "experimental", "study design"]
-            RESULTS = ["results", "findings"]
-            CONCLUSIONS = ["conclusion", "conclusions", "discussion and conclusion", "summary"]
-            REFERENCES = ["references", "bibliography"]
-
-            if mapped.get('abstract'):
-                sections['abstract'] = pages_for_heading_variants(ABSTRACT) or pages_for_value((mapped.get('abstract') or '')[:80])
-            if mapped.get('methodology'):
-                sections['methodology'] = pages_for_heading_variants(METHODS) or pages_for_value((mapped.get('methodology') or '')[:80])
-            if mapped.get('results'):
-                sections['results'] = pages_for_heading_variants(RESULTS) or pages_for_value((mapped.get('results') or '')[:80])
-            if mapped.get('conclusions'):
-                sections['conclusions'] = pages_for_heading_variants(CONCLUSIONS) or pages_for_value((mapped.get('conclusions') or '')[:80])
-            if mapped.get('references'):
-                sections['references'] = pages_for_heading_variants(REFERENCES)
-
-            # DOI and citations
-            doi_pages = pages_for_value(mapped.get('doi')) if mapped.get('doi') else []
-            citations_entries = entries_with_pages(mapped.get('citations') or [])
-
-            # Metrics
-            metrics = mapped.get('research_metrics') or {}
-            metrics_prov = {
-                'p_values': entries_with_pages(metrics.get('p_values') or []),
-                'sample_sizes': entries_with_pages(metrics.get('sample_sizes') or []),
-                'confidence_intervals': entries_with_pages(metrics.get('confidence_intervals') or []),
-                'effect_sizes': entries_with_pages(metrics.get('effect_sizes') or []),
-                'means_sd': entries_with_pages(metrics.get('means_sd') or []),
-                'percentages': entries_with_pages(metrics.get('percentages') or []),
-            }
-
-            # Authors/Affiliations pages (aggregate)
-            authors_pages = sorted(list({p for a in (mapped.get('authors') or []) for p in pages_for_value(a) }))[:10]
-            affiliations_pages = sorted(list({p for a in (mapped.get('affiliations') or []) for p in pages_for_value(a) }))[:10]
-
-            # Aggregate table pages too
-            table_pages = sorted(list({t.get('page') for t in (tables or []) if isinstance(t, dict) and t.get('page')}))
-
-            provenance = {
-                'sections': sections,
-                'doi_pages': doi_pages,
-                'citations': citations_entries,
-                'metrics': metrics_prov,
-                'authors_pages': authors_pages,
-                'affiliations_pages': affiliations_pages,
-                'table_pages': table_pages,
-            }
-
-        # Optional LLM enrichment
-        enrich_flag = (request.form.get('enrich') or '').strip().lower() in ("1","true","yes")
-        if enrich_flag:
+        
+        # Optional enrichment
+        if options.enrich:
             try:
-                print("DEBUG: Starting enrichment (sync endpoint)")
-                sys.stdout.flush()
-            except Exception:
-                pass
-            try:
-                enriched = enrich_extraction_with_llm(dtype, mapped, all_text, pages_text, inv_index)
-                new_mapped = enriched.get('mapped_fields', mapped)
+                enriched = enrich_extraction_with_llm(result.get('type'), result.get('mapped_fields'), all_text, pages_text, build_inverted_index(pages_text))
+                new_mapped = enriched.get('mapped_fields', result.get('mapped_fields'))
                 if isinstance(new_mapped, dict):
-                    mapped = new_mapped
-                # Re-score confidence if enrichment occurred
-                if isinstance(mapped, dict) and mapped.get('enriched'):
-                    try:
-                        confidence = ConfidenceScorer().score(dtype, mapped, entities, validation, provenance, selected_fields)
-                    except Exception:
-                        pass
+                    result['mapped_fields'] = new_mapped
             except Exception:
                 pass
+        
+        return result
+    except Exception as e:
+        return {"error": f"Fallback extraction failed: {str(e)}"}
 
-        resp_json = {
-            "type": dtype,
-            "pages": len(pages_text),
-            "entities": entities,
-            "mapped_fields": mapped,
-            "custom_fields": result.get('custom_fields'),  # Add this line
-            "validation": validation,
-            "confidence": confidence,
-            "tables": tables,
-            "formulas": formulas,
-            "provenance": provenance,
-        }
+@app.post("/api/extract")
+def api_extract():
+    """MVP extraction endpoint: returns detected document type and basic entities.
+    Input: multipart/form-data with 'file' (PDF)
+    Output: { type, pages, entities: { emails, phones, amounts, dates } }
+    """
+    try:
+        if "file" not in request.files:
+            return jsonify({"error": "No file provided"}), 400
+        file = request.files["file"]
+        if file.filename == "":
+            return jsonify({"error": "No file selected"}), 400
+        if not allowed_pdf(file):
+            return jsonify({"error": "Invalid file type. Only PDF files are allowed."}), 400
+
+        # Persist to temp path
+        fname = secure_filename(file.filename) or f"upload_{uuid.uuid4()}.pdf"
+        temp_path = os.path.join(app.config["UPLOAD_FOLDER"], f"{uuid.uuid4()}_{fname}")
+        file.save(temp_path)
+
+        # Parse request parameters into ExtractionOptions
+        try:
+            selected_fields = json.loads(request.form.get('selected_fields') or '[]')
+            if not isinstance(selected_fields, list):
+                selected_fields = []
+        except Exception:
+            selected_fields = []
+
+        options = ExtractionOptions(
+            domain_override=request.form.get('domain_override'),
+            selected_fields=selected_fields,
+            custom_instructions=request.form.get('custom_instructions', ''),
+            enrich=request.form.get('enrich', '').lower() in ('1', 'true', 'yes'),
+            extract_tables=request.form.get('extract_tables', '').lower() in ('1', 'true', 'yes'),
+            extract_formulas=request.form.get('extract_formulas', '').lower() in ('1', 'true', 'yes')
+        )
+
+        # Use new pipeline if available, otherwise fallback to old logic
+        if _extraction_pipeline:
+            result = _extraction_pipeline.extract(temp_path, options)
+            resp_json = result.to_dict()
+        else:
+            # Fallback to old extraction logic
+            resp_json = _fallback_extract(temp_path, options)
 
         @after_this_request
         def _cleanup(resp):
@@ -3427,15 +3346,6 @@ def api_extract():
                 pass
             return resp
 
-        # Save to cache
-        try:
-            EXTRACT_CACHE[file_hash] = resp_json
-            # persist to disk
-            disk_path = _extract_cache_path(file_hash)
-            with open(disk_path, 'w', encoding='utf-8') as fh:
-                json.dump(resp_json, fh)
-        except Exception:
-            pass
         return jsonify(resp_json)
     except Exception as e:
         return jsonify({"error": f"Extraction failed: {str(e)}"}), 500
@@ -3455,225 +3365,84 @@ def api_extract_async():
         temp_path = os.path.join(app.config["UPLOAD_FOLDER"], f"{uuid.uuid4()}_{fname}")
         upfile.save(temp_path)
 
-        # Read form parameters before starting background thread
-        override = (request.form.get('domain_override') or '').strip().lower()
-        # Optional explicit field selection (JSON array)
+        # Parse request parameters into ExtractionOptions
         try:
             selected_fields = json.loads(request.form.get('selected_fields') or '[]')
             if not isinstance(selected_fields, list):
                 selected_fields = []
         except Exception:
             selected_fields = []
-        enrich_flag = (request.form.get('enrich') or '').strip().lower() in ("1","true","yes")
-        custom_instructions = (request.form.get('custom_instructions') or '').strip()
-        use_ocr_flag = (request.form.get('use_ocr') or '').strip().lower() in ("1","true","yes")
+
+        options = ExtractionOptions(
+            domain_override=request.form.get('domain_override'),
+            selected_fields=selected_fields,
+            custom_instructions=request.form.get('custom_instructions', ''),
+            enrich=request.form.get('enrich', '').lower() in ('1', 'true', 'yes'),
+            extract_tables=request.form.get('extract_tables', '').lower() in ('1', 'true', 'yes'),
+            extract_formulas=request.form.get('extract_formulas', '').lower() in ('1', 'true', 'yes')
+        )
 
         job_id = str(uuid.uuid4())
         with EXTRACT_JOBS_LOCK:
             EXTRACT_JOBS[job_id] = {"progress": 0, "done": False, "error": None, "result": None}
 
-        custom_instructions = (request.form.get('custom_instructions') or '').strip()
-        def run_job(jid: str, path: str, override: str, enrich_flag: bool, use_ocr_flag: bool, custom_instructions: str, selected_fields_param: list[str]):
+        def run_job(jid: str, path: str, extraction_options: ExtractionOptions):
             def set_progress(p: int):
                 with EXTRACT_JOBS_LOCK:
                     if jid in EXTRACT_JOBS:
                         EXTRACT_JOBS[jid]["progress"] = max(0, min(100, int(p)))
+            
             try:
-                set_progress(5)
-                pages_text = []
-                if use_ocr_flag and _OCR_SERVICE is not None:
-                    try:
-                        ocr_result = _OCR_SERVICE.hybrid_extraction(path)
-                        if ocr_result.get('success'):
-                            pages_text = [p.get('text') or "" for p in (ocr_result.get('pages') or [])]
-                        else:
-                            reader = PdfReader(path)
-                            for p in reader.pages:
-                                try:
-                                    pages_text.append(p.extract_text() or "")
-                                except Exception:
-                                    pages_text.append("")
-                    except Exception:
-                        reader = PdfReader(path)
-                        for p in reader.pages:
-                            try:
-                                pages_text.append(p.extract_text() or "")
-                            except Exception:
-                                pages_text.append("")
+                print(f"DEBUG: Starting async job {jid} for file {path}")
+                set_progress(10)
+                
+                # Use new pipeline if available, otherwise fallback to old logic
+                if _extraction_pipeline:
+                    print(f"DEBUG: Using new extraction pipeline for job {jid}")
+                    result = _extraction_pipeline.extract(path, extraction_options)
+                    resp_json = result.to_dict()
+                    print(f"DEBUG: Pipeline extraction completed for job {jid}")
                 else:
-                    reader = PdfReader(path)
-                    try:
-                        from concurrent.futures import ThreadPoolExecutor
-                        def _extract_page(i):
-                            try:
-                                return reader.pages[i].extract_text() or ""
-                            except Exception:
-                                return ""
-                        with ThreadPoolExecutor(max_workers=4) as ex:
-                            pages_text = list(ex.map(_extract_page, range(len(reader.pages))))
-                    except Exception:
-                        pages_text = []
-                        for p in reader.pages:
-                            try:
-                                pages_text.append(p.extract_text() or "")
-                            except Exception:
-                                pages_text.append("")
-                all_text = "\n".join(pages_text)
-                set_progress(20)
-
-                # Import pipeline components within the worker context
-                try:
-                    from extraction.confidence import ConfidenceScorer
-                except Exception:
-                    from backend.extraction.confidence import ConfidenceScorer  # type: ignore
-
-                # AI-only extraction path in async job (domain-focused if provided)
-                domain_for_job = _normalize_domain(override)
-                selected_valid = _validate_selected_fields(domain_for_job, selected_fields_param)
-                result = ai_only_extract(all_text, pages_text, custom_instructions, domain_for_job, selected_valid)
-                dtype = result.get('type')
-                entities = result.get('entities')
-                mapped = result.get('mapped_fields')
-                validation = result.get('validation')
-                tables = result.get('tables')
-                formulas = result.get('formulas')
-                provenance = result.get('provenance')
-                confidence = result.get('confidence')
-                set_progress(70)
-
-                provenance = None
-                if dtype == 'research':
-                    def pages_for_heading_variants(variants):
-                        found_pages = []
-                        for idx, txt in enumerate(pages_text):
-                            for h in variants:
-                                try:
-                                    if re.search(rf"(?mi)^\s*(?:\d+\.?\s*)?{re.escape(h)}\s*:?\s*$", txt):
-                                        found_pages.append(idx + 1)
-                                        break
-                                except Exception:
-                                    continue
-                        return sorted(list({p for p in found_pages}))[:10]
-                    def pages_for_value(value: str, max_hits: int = 5):
-                        if not value:
-                            return []
-                        pages: list[int] = []
-                        try:
-                            tokens = re.findall(r"[A-Za-z][A-Za-z0-9\-]{3,}", value.lower())
-                            candidates: set[int] = set()
-                            for t in tokens[:3]:  # first few informative tokens
-                                for p in inv_index.get(t, []):
-                                    candidates.add(p)
-                            for p in sorted(candidates) or range(1, len(pages_text)+1):
-                                txt = pages_text[p-1]
-                                if not txt:
-                                    continue
-                                if re.search(re.escape(value.strip()), txt, flags=re.IGNORECASE):
-                                    pages.append(p)
-                                    if len(pages) >= max_hits:
-                                        break
-                        except Exception:
-                            pass
-                        return pages
-                    def entries_with_pages(values: list[str]):
-                        out = []
-                        for v in values or []:
-                            out.append({"value": v, "pages": pages_for_value(v)})
-                        return out
-                    sections = {}
-                    ABSTRACT = ["abstract"]
-                    METHODS = ["methods", "method", "methodology", "materials and methods", "experimental", "study design"]
-                    RESULTS = ["results", "findings"]
-                    CONCLUSIONS = ["conclusion", "conclusions", "discussion and conclusion", "summary"]
-                    REFERENCES = ["references", "bibliography"]
-                    if mapped.get('abstract'):
-                        sections['abstract'] = pages_for_heading_variants(ABSTRACT) or pages_for_value((mapped.get('abstract') or '')[:80])
-                    if mapped.get('methodology'):
-                        sections['methodology'] = pages_for_heading_variants(METHODS) or pages_for_value((mapped.get('methodology') or '')[:80])
-                    if mapped.get('results'):
-                        sections['results'] = pages_for_heading_variants(RESULTS) or pages_for_value((mapped.get('results') or '')[:80])
-                    if mapped.get('conclusions'):
-                        sections['conclusions'] = pages_for_heading_variants(CONCLUSIONS) or pages_for_value((mapped.get('conclusions') or '')[:80])
-                    if mapped.get('references'):
-                        sections['references'] = pages_for_heading_variants(REFERENCES)
-                    doi_pages = pages_for_value(mapped.get('doi')) if mapped.get('doi') else []
-                    citations_entries = entries_with_pages(mapped.get('citations') or [])
-                    metrics = mapped.get('research_metrics') or {}
-                    metrics_prov = {
-                        'p_values': entries_with_pages(metrics.get('p_values') or []),
-                        'sample_sizes': entries_with_pages(metrics.get('sample_sizes') or []),
-                        'confidence_intervals': entries_with_pages(metrics.get('confidence_intervals') or []),
-                        'effect_sizes': entries_with_pages(metrics.get('effect_sizes') or []),
-                        'means_sd': entries_with_pages(metrics.get('means_sd') or []),
-                        'percentages': entries_with_pages(metrics.get('percentages') or []),
-                    }
-                    authors_pages = sorted(list({p for a in (mapped.get('authors') or []) for p in pages_for_value(a) }))[:10]
-                    affiliations_pages = sorted(list({p for a in (mapped.get('affiliations') or []) for p in pages_for_value(a) }))[:10]
-                    table_pages = sorted(list({t.get('page') for t in (tables or []) if isinstance(t, dict) and t.get('page')}))
-                    provenance = {
-                        'sections': sections,
-                        'doi_pages': doi_pages,
-                        'citations': citations_entries,
-                        'metrics': metrics_prov,
-                        'authors_pages': authors_pages,
-                        'affiliations_pages': affiliations_pages,
-                        'table_pages': table_pages,
-                    }
-                set_progress(85)
-                confidence = ConfidenceScorer().score(dtype, mapped, entities, validation, provenance, selected_valid)
-                set_progress(98)
-
-                # Optional enrichment using flag passed to thread
-                if enrich_flag:
-                    try:
-                        print("DEBUG: Starting enrichment (async endpoint)")
-                        sys.stdout.flush()
-                    except Exception:
-                        pass
-                    try:
-                        enriched = enrich_extraction_with_llm(dtype, mapped, all_text, pages_text, build_inverted_index(pages_text))
-                        new_mapped = enriched.get('mapped_fields', mapped)
-                        if isinstance(new_mapped, dict):
-                            mapped = new_mapped
-                        if isinstance(mapped, dict) and mapped.get('enriched'):
-                            try:
-                                confidence = ConfidenceScorer().score(dtype, mapped, entities, validation, provenance, selected_fields)
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-
-                result = {
-                    "type": dtype,
-                    "pages": len(pages_text),
-                    "entities": entities,
-                    "mapped_fields": mapped,
-                    "custom_instructions_result": result.get('custom_instructions_result'),
-                    "validation": validation,
-                    "confidence": confidence,
-                    "tables": tables,
-                    "formulas": formulas,
-                    "provenance": provenance,
-                }
+                    print(f"DEBUG: Using fallback extraction for job {jid}")
+                    # Fallback to old extraction logic
+                    resp_json = _fallback_extract(path, extraction_options)
+                    print(f"DEBUG: Fallback extraction completed for job {jid}")
+                
+                set_progress(90)
+                
+                # Ensure result has expected format
+                if not isinstance(resp_json, dict):
+                    print(f"DEBUG: Invalid result format for job {jid}: {type(resp_json)}")
+                    resp_json = {"error": "Invalid extraction result"}
+                
+                set_progress(100)
+                
                 with EXTRACT_JOBS_LOCK:
                     if jid in EXTRACT_JOBS:
-                        EXTRACT_JOBS[jid]["result"] = result
+                        EXTRACT_JOBS[jid]["result"] = resp_json
                         EXTRACT_JOBS[jid]["done"] = True
                         EXTRACT_JOBS[jid]["progress"] = 100
+                        print(f"DEBUG: Job {jid} completed successfully")
+                        
             except Exception as e:
+                print(f"DEBUG: Error in job {jid}: {str(e)}")
+                import traceback
+                traceback.print_exc()
                 with EXTRACT_JOBS_LOCK:
                     if jid in EXTRACT_JOBS:
                         EXTRACT_JOBS[jid]["error"] = str(e)
                         EXTRACT_JOBS[jid]["done"] = True
                         EXTRACT_JOBS[jid]["progress"] = 100
+                        print(f"DEBUG: Job {jid} marked as failed with error: {str(e)}")
             finally:
                 try:
                     if os.path.isfile(path):
                         os.remove(path)
-                except Exception:
-                    pass
+                        print(f"DEBUG: Cleaned up temp file {path}")
+                except Exception as e:
+                    print(f"DEBUG: Error cleaning up temp file {path}: {str(e)}")
 
-        th = threading.Thread(target=run_job, args=(job_id, temp_path, override, enrich_flag, use_ocr_flag, custom_instructions, selected_fields), daemon=True)
+        th = threading.Thread(target=run_job, args=(job_id, temp_path, options), daemon=True)
         th.start()
         return jsonify({"job_id": job_id})
     except Exception as e:
@@ -3684,14 +3453,26 @@ def api_extract_status(job_id: str):
     with EXTRACT_JOBS_LOCK:
         job = EXTRACT_JOBS.get(job_id)
         if not job:
+            print(f"DEBUG: Job {job_id} not found in EXTRACT_JOBS")
             return jsonify({"error": "not_found"}), 404
-        return jsonify({
+        
+        status_response = {
             "job_id": job_id,
             "progress": job.get("progress", 0),
             "done": job.get("done", False),
             "error": job.get("error"),
             "result": job.get("result") if job.get("done") else None,
-        })
+        }
+        
+        # Add debug info
+        if job.get("error"):
+            print(f"DEBUG: Job {job_id} has error: {job.get('error')}")
+        elif job.get("done"):
+            print(f"DEBUG: Job {job_id} completed successfully")
+        else:
+            print(f"DEBUG: Job {job_id} still running, progress: {job.get('progress', 0)}%")
+        
+        return jsonify(status_response)
 
 # ── Batch extraction (multiple PDFs) ───────────────────────────────
 @app.post("/api/extract/batch")
@@ -3700,15 +3481,23 @@ def api_extract_batch_start():
         files = request.files.getlist('files') or []
         if not files:
             return jsonify({"error": "No files provided"}), 400
-        domain = (request.form.get('domain') or '').strip().lower()
+        
+        # Parse request parameters into ExtractionOptions
         try:
             selected_fields = json.loads(request.form.get('selected_fields') or '[]')
             if not isinstance(selected_fields, list):
                 selected_fields = []
         except Exception:
             selected_fields = []
-        use_ocr_flag = (request.form.get('use_ocr') or '').strip().lower() in ("1","true","yes")
-        custom_instructions = (request.form.get('custom_instructions') or '').strip()
+
+        options = ExtractionOptions(
+            domain_override=request.form.get('domain'),
+            selected_fields=selected_fields,
+            custom_instructions=request.form.get('custom_instructions', ''),
+            enrich=False,  # Batch processing doesn't use enrichment
+            extract_tables=request.form.get('extract_tables', '').lower() in ('1', 'true', 'yes'),
+            extract_formulas=request.form.get('extract_formulas', '').lower() in ('1', 'true', 'yes')
+        )
 
         batch_id = str(uuid.uuid4())
         with EXTRACT_JOBS_LOCK:
@@ -3725,56 +3514,21 @@ def api_extract_batch_start():
             f.save(temp_path)
             saved_paths.append((fname, temp_path))
 
-        def run_batch(bid: str, items: list[tuple[str, str]], domain: str, selected_fields: list[str], use_ocr_flag: bool, custom_instructions: str):
+        def run_batch(bid: str, items: list[tuple[str, str]], extraction_options: ExtractionOptions):
             try:
                 total = max(1, len(items))
                 out_results = []
                 for idx, (orig, path) in enumerate(items, start=1):
                     try:
-                        # Per-file extract
-                        pages_text = []
-                        if use_ocr_flag and _OCR_SERVICE is not None:
-                            try:
-                                ocr_result = _OCR_SERVICE.hybrid_extraction(path)
-                                if ocr_result.get('success'):
-                                    pages_text = [p.get('text') or "" for p in (ocr_result.get('pages') or [])]
-                                else:
-                                    reader = PdfReader(path)
-                                    for p in reader.pages:
-                                        try:
-                                            pages_text.append(p.extract_text() or "")
-                                        except Exception:
-                                            pages_text.append("")
-                            except Exception:
-                                reader = PdfReader(path)
-                                for p in reader.pages:
-                                    try:
-                                        pages_text.append(p.extract_text() or "")
-                                    except Exception:
-                                        pages_text.append("")
+                        # Use new pipeline if available, otherwise fallback to old logic
+                        if _extraction_pipeline:
+                            result = _extraction_pipeline.extract(path, extraction_options)
+                            result_dict = result.to_dict()
                         else:
-                            reader = PdfReader(path)
-                            try:
-                                from concurrent.futures import ThreadPoolExecutor
-                                def _extract_page(i):
-                                    try:
-                                        return reader.pages[i].extract_text() or ""
-                                    except Exception:
-                                        return ""
-                                with ThreadPoolExecutor(max_workers=4) as ex:
-                                    pages_text = list(ex.map(_extract_page, range(len(reader.pages))))
-                            except Exception:
-                                pages_text = []
-                                for p in reader.pages:
-                                    try:
-                                        pages_text.append(p.extract_text() or "")
-                                    except Exception:
-                                        pages_text.append("")
-                        all_text = "\n".join(pages_text)
-                        domain_norm = _normalize_domain(domain)
-                        selected_valid = _validate_selected_fields(domain_norm, selected_fields)
-                        result = ai_only_extract(all_text, pages_text, custom_instructions, domain_norm, selected_valid)
-                        out_results.append({"file": orig, "result": result})
+                            # Fallback to old extraction logic
+                            result_dict = _fallback_extract(path, extraction_options)
+                        
+                        out_results.append({"file": orig, "result": result_dict})
                     except Exception as fe:
                         out_results.append({"file": orig, "error": str(fe)})
                     finally:
@@ -3799,7 +3553,7 @@ def api_extract_batch_start():
                         EXTRACT_JOBS[bid]["done"] = True
                         EXTRACT_JOBS[bid]["progress"] = 100
 
-        th = threading.Thread(target=run_batch, args=(batch_id, saved_paths, domain, selected_fields, use_ocr_flag, custom_instructions), daemon=True)
+        th = threading.Thread(target=run_batch, args=(batch_id, saved_paths, options), daemon=True)
         th.start()
         return jsonify({"batch_id": batch_id})
     except Exception as e:
@@ -3861,60 +3615,43 @@ def api_extract_pdf():
         if not allowed_pdf(file):
             return jsonify({"error": "Invalid file type. Only PDF files are allowed."}), 400
 
-        # Reuse synchronous extract logic to get structured data
         # Save to temp
         fname = secure_filename(file.filename) or f"upload_{uuid.uuid4()}.pdf"
         temp_path = os.path.join(app.config["UPLOAD_FOLDER"], f"{uuid.uuid4()}_{fname}")
         file.save(temp_path)
 
-        # Run extraction pipeline (similar to /api/extract)
-        reader = PdfReader(temp_path)
-        pages_text = []
-        try:
-            for p in reader.pages:
-                try:
-                    pages_text.append(p.extract_text() or "")
-                except Exception:
-                    pages_text.append("")
-        except Exception:
-            pages_text = []
-        all_text = "\n".join(pages_text)
-
-        try:
-            from extraction.confidence import ConfidenceScorer
-        except Exception:
-            from backend.extraction.confidence import ConfidenceScorer  # type: ignore
-
-        override = (request.form.get('domain_override') or '').strip().lower()
-        # Optional selected fields for focused PDF rendering
+        # Parse request parameters into ExtractionOptions
         try:
             selected_fields = json.loads(request.form.get('selected_fields') or '[]')
             if not isinstance(selected_fields, list):
                 selected_fields = []
         except Exception:
             selected_fields = []
-        enrich_flag = (request.form.get('enrich') or '').strip().lower() in ("1","true","yes")
-        custom_instructions = (request.form.get('custom_instructions') or '').strip()
-        
-        # AI-only extraction for PDF endpoint (honor domain/fields if provided)
-        domain_for_pdf = _normalize_domain(override)
-        selected_valid = _validate_selected_fields(domain_for_pdf, selected_fields)
-        result = ai_only_extract(all_text, pages_text, custom_instructions, domain_for_pdf, selected_valid)
-        dtype = result.get('type')
-        entities = result.get('entities')
-        mapped = result.get('mapped_fields')
-        validation = result.get('validation')
-        tables = result.get('tables')
-        formulas = result.get('formulas')
-        confidence = result.get('confidence')
 
-        # Enrichment toggle in AI-only mode: no-op or could request extended fields in prompt
-        if enrich_flag:
-            try:
-                print("DEBUG: Enrich flag acknowledged (pdf endpoint, AI-only mode)")
-                sys.stdout.flush()
-            except Exception:
-                pass
+        options = ExtractionOptions(
+            domain_override=request.form.get('domain_override'),
+            selected_fields=selected_fields,
+            custom_instructions=request.form.get('custom_instructions', ''),
+            enrich=request.form.get('enrich', '').lower() in ('1', 'true', 'yes'),
+            use_ocr=False  # PDF reports don't use OCR
+        )
+
+        # Use new pipeline if available, otherwise fallback to old logic
+        if _extraction_pipeline:
+            result = _extraction_pipeline.extract(temp_path, options)
+            result_dict = result.to_dict()
+        else:
+            # Fallback to old extraction logic
+            result_dict = _fallback_extract(temp_path, options)
+
+        # Extract data for PDF generation
+        dtype = result_dict.get('type', 'general')
+        entities = result_dict.get('entities', {})
+        mapped = result_dict.get('mapped_fields', {})
+        validation = result_dict.get('validation', {})
+        tables = result_dict.get('tables', [])
+        formulas = result_dict.get('formulas', [])
+        confidence = result_dict.get('confidence', {})
 
         # Build PDF in-memory using ReportLab
         buffer = io.BytesIO()
@@ -3928,8 +3665,8 @@ def api_extract_pdf():
         elems.append(Spacer(1, 10))
 
         meta_style = styles['Normal']
-        elems.append(Paragraph(f"Detected Type: <b>{dtype or 'general'}</b>", meta_style))
-        elems.append(Paragraph(f"Pages: <b>{len(pages_text)}</b>", meta_style))
+        elems.append(Paragraph(f"Detected Type: <b>{dtype}</b>", meta_style))
+        elems.append(Paragraph(f"Pages: <b>{result_dict.get('pages', 0)}</b>", meta_style))
         elems.append(Spacer(1, 10))
 
         # Confidence
@@ -3961,19 +3698,8 @@ def api_extract_pdf():
                 elems.append(Paragraph(f"• <b>{k}:</b> {text_value}", meta_style))
             elems.append(Spacer(1, 8))
 
-        # Custom Instructions Result (only if present)
-        cir = result.get('custom_instructions_result') if isinstance(result, dict) else None
-        if cir:
-            elems.append(Paragraph("<b>Custom Instructions Result</b>", styles['Heading3']))
-            try:
-                cir_text = str(cir)
-            except Exception:
-                cir_text = json.dumps(cir, ensure_ascii=False)
-            elems.append(Paragraph(cir_text, meta_style))
-            elems.append(Spacer(1, 8))
-
         # Custom Fields (only if present)
-        custom_fields = result.get('custom_fields') if isinstance(result, dict) else {}
+        custom_fields = result_dict.get('custom_fields') if isinstance(result_dict, dict) else {}
         if isinstance(custom_fields, dict) and custom_fields:
             elems.append(Paragraph("<b>Custom Fields</b>", styles['Heading3']))
             for ck, cv in custom_fields.items():
