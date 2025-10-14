@@ -3270,21 +3270,17 @@ def api_extract():
 
         # Use modular extraction pipeline
         try:
-            from extraction.pipeline import DocumentTypeDetector, BasicExtractor, DomainFieldMapper, Validator
-            from extraction.specialized import Router as ExtractRouter, TableExtractor, FormulaExtractor
+            from extraction.confidence import ConfidenceScorer
         except Exception:
-            from backend.extraction.pipeline import DocumentTypeDetector, BasicExtractor, DomainFieldMapper, Validator  # type: ignore
-            from backend.extraction.specialized import Router as ExtractRouter, TableExtractor, FormulaExtractor  # type: ignore
+            from backend.extraction.confidence import ConfidenceScorer  # type: ignore
 
         # Allow client to override detected type
         override = (request.form.get('domain_override') or '').strip().lower()
-        force_tables = request.form.get('force_tables')
-        force_formulas = request.form.get('force_formulas')
-        ft = (force_tables.lower() in ('1','true','yes')) if isinstance(force_tables, str) else None
-        ff = (force_formulas.lower() in ('1','true','yes')) if isinstance(force_formulas, str) else None
         # AI-only extraction path
         custom_instructions = (request.form.get('custom_instructions') or '').strip()
-        result = ai_only_extract(all_text, pages_text, custom_instructions)
+        domain_norm = _normalize_domain(override)
+        selected_fields = _validate_selected_fields(domain_norm, [])
+        result = ai_only_extract(all_text, pages_text, custom_instructions, domain_norm, selected_fields)
         dtype = result.get('type')
         entities = result.get('entities')
         mapped = result.get('mapped_fields')
@@ -3403,7 +3399,7 @@ def api_extract():
                 # Re-score confidence if enrichment occurred
                 if isinstance(mapped, dict) and mapped.get('enriched'):
                     try:
-                        confidence = ConfidenceScorer().score(dtype, mapped, entities, validation, provenance)
+                        confidence = ConfidenceScorer().score(dtype, mapped, entities, validation, provenance, selected_fields)
                     except Exception:
                         pass
             except Exception:
@@ -3527,11 +3523,9 @@ def api_extract_async():
 
                 # Import pipeline components within the worker context
                 try:
-                    from extraction.pipeline import DocumentTypeDetector, BasicExtractor, DomainFieldMapper, Validator, ConfidenceScorer
-                    from extraction.specialized import Router as ExtractRouter, TableExtractor, FormulaExtractor
+                    from extraction.confidence import ConfidenceScorer
                 except Exception:
-                    from backend.extraction.pipeline import DocumentTypeDetector, BasicExtractor, DomainFieldMapper, Validator, ConfidenceScorer  # type: ignore
-                    from backend.extraction.specialized import Router as ExtractRouter, TableExtractor, FormulaExtractor  # type: ignore
+                    from backend.extraction.confidence import ConfidenceScorer  # type: ignore
 
                 # AI-only extraction path in async job (domain-focused if provided)
                 domain_for_job = _normalize_domain(override)
@@ -3626,7 +3620,7 @@ def api_extract_async():
                         'table_pages': table_pages,
                     }
                 set_progress(85)
-                confidence = ConfidenceScorer().score(dtype, mapped, entities, validation, provenance)
+                confidence = ConfidenceScorer().score(dtype, mapped, entities, validation, provenance, selected_valid)
                 set_progress(98)
 
                 # Optional enrichment using flag passed to thread
@@ -3643,7 +3637,7 @@ def api_extract_async():
                             mapped = new_mapped
                         if isinstance(mapped, dict) and mapped.get('enriched'):
                             try:
-                                confidence = ConfidenceScorer().score(dtype, mapped, entities, validation, provenance)
+                                confidence = ConfidenceScorer().score(dtype, mapped, entities, validation, provenance, selected_fields)
                             except Exception:
                                 pass
                     except Exception:
@@ -3887,11 +3881,9 @@ def api_extract_pdf():
         all_text = "\n".join(pages_text)
 
         try:
-            from extraction.pipeline import DocumentTypeDetector, BasicExtractor, DomainFieldMapper, Validator, ConfidenceScorer
-            from extraction.specialized import Router as ExtractRouter, TableExtractor, FormulaExtractor
+            from extraction.confidence import ConfidenceScorer
         except Exception:
-            from backend.extraction.pipeline import DocumentTypeDetector, BasicExtractor, DomainFieldMapper, Validator, ConfidenceScorer  # type: ignore
-            from backend.extraction.specialized import Router as ExtractRouter, TableExtractor, FormulaExtractor  # type: ignore
+            from backend.extraction.confidence import ConfidenceScorer  # type: ignore
 
         override = (request.form.get('domain_override') or '').strip().lower()
         # Optional selected fields for focused PDF rendering

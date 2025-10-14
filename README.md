@@ -78,6 +78,17 @@ A web-based PDF toolbox that provides various PDF manipulation and conversion to
 - Reorder Pages
 - Contact Form 
 
+## Extraction
+
+Current extraction is AI-only and schema-driven. The classic heuristic pipeline and specialized table/formula extractors were removed for simplicity and maintainability. OCR remains available in the async extraction endpoint via `OCRService`.
+
+- Sync `/api/extract`: reads native PDF text, accepts `domain_override` and optional `custom_instructions`, and calls the AI extractor. Confidence is computed with `ConfidenceScorer`.
+- Async `/api/extract/async`: supports an optional `use_ocr=1` flag; when enabled, uses a hybrid native-text + OCR flow before AI extraction. Confidence is computed with `ConfidenceScorer`.
+
+Notes:
+- `extraction/confidence.py` exports `ConfidenceScorer`.
+- `extraction/specialized.py` was removed (no tables/formulas wiring at this time).
+
 ## License
 
 Licensed under AGPL-3.0-only. See the `LICENSE` file for details.
