@@ -53,6 +53,19 @@ from dotenv import load_dotenv
 import requests
 import json
 
+# Register async endpoints for Explain and Summarize tools
+try:
+    from explain.endpoints import register_explain_endpoints
+except Exception as e:
+    register_explain_endpoints = None  # type: ignore
+    print(f"Warning: failed to import explain endpoints: {e}")
+
+try:
+    from summarize.endpoints import register_summarize_endpoints
+except Exception as e:
+    register_summarize_endpoints = None  # type: ignore
+    print(f"Warning: failed to import summarize endpoints: {e}")
+
 try:
     from extraction.ocr_service import OCRService
 except Exception:
@@ -727,6 +740,21 @@ def normalize_ai_explain_payload(payload):
 app = Flask(__name__)
 app.config["UPLOAD_FOLDER"] = "temp"
 os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
+
+# Register Explain/Summarize async endpoints if available
+if register_explain_endpoints:
+    try:
+        register_explain_endpoints(app)
+        print("Explain async endpoints registered")
+    except Exception as e:
+        print(f"Warning: failed to register explain endpoints: {e}")
+
+if register_summarize_endpoints:
+    try:
+        register_summarize_endpoints(app)
+        print("Summarize async endpoints registered")
+    except Exception as e:
+        print(f"Warning: failed to register summarize endpoints: {e}")
 
 # Job storage for async synthesis
 SYNTHESIS_JOBS = {}
