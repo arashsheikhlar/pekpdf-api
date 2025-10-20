@@ -2394,7 +2394,7 @@ def file_too_large(e):
 
 @app.route("/api/ai-chat-pdf", methods=["POST"])
 def ai_chat_pdf():
-    """AI Chat with PDF - allows users to ask questions about PDF content."""
+    """AI Chat with PDF - allows users to ask questions about PDF content with full document extraction and citations."""
     try:
         if "file" not in request.files:
             return jsonify({"error": "No file provided"}), 400
@@ -2406,49 +2406,82 @@ def ai_chat_pdf():
         if not allowed_pdf(file):
             return jsonify({"error": "Invalid file type. Only PDF files are allowed."}), 400
         
-        # Extract text from PDF for AI processing
+        # Extract full text from PDF with page mapping
         pdf_reader = PdfReader(file)
-        text_content = ""
+        pages_data = []
+        full_text = ""
         
-        for page in pdf_reader.pages:
-            text_content += page.extract_text() + "\n"
+        for page_num, page in enumerate(pdf_reader.pages, 1):
+            page_text = page.extract_text()
+            pages_data.append({
+                "page": page_num,
+                "text": page_text
+            })
+            full_text += f"\n[Page {page_num}]\n{page_text}\n"
         
         # Get question from request
         question = request.form.get('question', 'Tell me about this PDF')
         
-        # Debug: Print extracted content length
-        print(f"DEBUG: PDF has {len(pdf_reader.pages)} pages, extracted {len(text_content)} characters")
+        # Debug logging
+        print(f"DEBUG: PDF has {len(pdf_reader.pages)} pages, extracted {len(full_text)} characters")
         print(f"DEBUG: Question received: '{question}'")
-        print(f"DEBUG: First 200 chars of content: {text_content[:200]}")
         
-        # Create prompt for Ollama with more specific instructions
-        prompt = f"""Based on the PDF content below, answer the specific question asked. Give different answers for different questions.
+        # Import chunking utilities
+        try:
+            from common.text_chunker import chunk_text_with_overlap, find_relevant_chunks
+            
+            # Chunk text if too large
+            if len(full_text) > 15000:
+                chunks = chunk_text_with_overlap(full_text, max_chars=12000, overlap=500)
+                relevant_chunks = find_relevant_chunks(question, chunks, top_k=2)
+                context_text = "\n\n".join([chunk["text"] for chunk in relevant_chunks])
+            else:
+                context_text = full_text[:15000]
+        except Exception as e:
+            print(f"DEBUG: Chunking failed, using truncated text: {e}")
+            context_text = full_text[:15000]
+        
+        # Enhanced prompt with page references
+        prompt = f"""You are analyzing a {len(pages_data)}-page PDF document.
+Answer the question based on the content below. When referencing information, 
+include the page number in your response using format like "On page 3..." or "According to page 5...".
 
-PDF DOCUMENT ({len(pdf_reader.pages)} pages):
-{text_content[:2000]}
+DOCUMENT CONTENT:
+{context_text}
 
 QUESTION: {question}
 
-Answer this specific question based on the PDF content above. Be specific and reference what you find in the document. If the question asks about something not in the document, say so clearly."""
+Provide a detailed answer and cite specific page numbers where relevant information was found."""
 
-        # Call AI service with debugging and fallback
-        print(f"DEBUG: Sending prompt to AI service (first 300 chars): {prompt[:300]}")
-        print(f"DEBUG: About to call call_ai_service with AI_SERVICE={AI_SERVICE}")
+        # Call AI service
+        print(f"DEBUG: Sending prompt to AI service (length: {len(prompt)} chars)")
         sys.stdout.flush()
         ai_response_text = call_ai_service(prompt)
-        print(f"DEBUG: AI service response: {ai_response_text[:200]}")
+        print(f"DEBUG: AI service response length: {len(ai_response_text)} chars")
         sys.stdout.flush()
         
-        # If AI service is not available, provide a contextual response
+        # Handle AI service errors
         if "Error" in ai_response_text:
             print(f"DEBUG: AI service returned error: {ai_response_text}")
             sys.stdout.flush()
-            ai_response_text = f"Based on your question '{question}' about this {len(pdf_reader.pages)}-page PDF document, I can see the content but there's an issue with the AI service: {ai_response_text}. The document appears to contain: {text_content[:300]}..."
+            ai_response_text = f"I encountered an issue with the AI service: {ai_response_text}. However, I can tell you this is a {len(pdf_reader.pages)}-page document."
+        
+        # Build citations
+        try:
+            from common.citation_builder import build_citations, format_response_with_citations
+            
+            citations = build_citations(ai_response_text, pages_data)
+            response_with_citations = format_response_with_citations(ai_response_text, citations)
+        except Exception as e:
+            print(f"DEBUG: Citation building failed: {e}")
+            citations = []
+            response_with_citations = ai_response_text
         
         ai_response = {
-            "message": ai_response_text.strip(),
+            "message": response_with_citations.strip(),
             "pages_analyzed": len(pdf_reader.pages),
-            "content_preview": text_content[:200] + "..." if len(text_content) > 200 else text_content
+            "citations": citations,
+            "content_preview": full_text[:200] + "..." if len(full_text) > 200 else full_text
         }
         
         return jsonify(ai_response)
