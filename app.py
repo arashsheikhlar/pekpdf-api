@@ -31,6 +31,7 @@ import sys
 import threading
 import hashlib
 import time
+from collections import defaultdict
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, ListFlowable, ListItem
@@ -726,6 +727,10 @@ def normalize_ai_explain_payload(payload):
 app = Flask(__name__)
 app.config["UPLOAD_FOLDER"] = "temp"
 os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
+
+# Job storage for async synthesis
+SYNTHESIS_JOBS = {}
+SYNTHESIS_JOBS_LOCK = threading.Lock()
 
 # Initialize extraction services
 _extraction_pipeline = None
@@ -2747,9 +2752,16 @@ def ai_document_synthesis():
             return jsonify({"error": "format must be one of: report|brief|minutes"}), 400
 
         # New optional controls
+        ALLOWED_DOMAINS = {
+            "invoice", "contract", "financial", "purchase_order", "receipt", 
+            "bank_statement", "tax_form", "resume", "legal_pleading", "patent", 
+            "medical_bill", "lab_report", "insurance_claim", "real_estate", 
+            "shipping_manifest", "research", "healthcare", "legal", "finance", "general"
+        }
+        
         domain_override = (request.form.get("domain_override") or "").lower().strip() or None
-        if domain_override and domain_override not in ("general", "legal", "finance", "research", "healthcare"):
-            return jsonify({"error": "domain_override must be one of: general|legal|finance|research|healthcare"}), 400
+        if domain_override and domain_override not in ALLOWED_DOMAINS:
+            return jsonify({"error": f"domain_override must be one of: {', '.join(sorted(ALLOWED_DOMAINS))}"}), 400
         template_profile = (request.form.get("template_profile") or "").lower().strip() or None
         if template_profile and template_profile not in ("executive_summary", "risk_assessment", "compliance_review"):
             return jsonify({"error": "template_profile must be one of: executive_summary|risk_assessment|compliance_review"}), 400
@@ -3245,6 +3257,328 @@ def ai_document_synthesis():
 
     except Exception as e:
         return jsonify({"error": f"Synthesis failed: {str(e)}"}), 500
+
+
+@app.post("/api/ai-document-synthesis/async")
+def ai_document_synthesis_async():
+    """Async version of synthesis - returns job_id immediately"""
+    try:
+        files = request.files.getlist("files")
+        if not files:
+            return jsonify({"error": "Upload at least one PDF file"}), 400
+        if any(not allowed_pdf(f) for f in files):
+            return jsonify({"error": "Only PDF files are allowed"}), 400
+
+        # Validate parameters
+        target_format = (request.form.get("format") or "report").lower().strip()
+        if target_format not in ("report", "brief", "minutes"):
+            return jsonify({"error": "format must be one of: report|brief|minutes"}), 400
+
+        ALLOWED_DOMAINS = {
+            "invoice", "contract", "financial", "purchase_order", "receipt", 
+            "bank_statement", "tax_form", "resume", "legal_pleading", "patent", 
+            "medical_bill", "lab_report", "insurance_claim", "real_estate", 
+            "shipping_manifest", "research", "healthcare", "legal", "finance", "general"
+        }
+        
+        domain_override = (request.form.get("domain_override") or "").lower().strip() or None
+        if domain_override and domain_override not in ALLOWED_DOMAINS:
+            return jsonify({"error": f"domain_override must be one of: {', '.join(sorted(ALLOWED_DOMAINS))}"}), 400
+            
+        template_profile = (request.form.get("template_profile") or "").lower().strip() or None
+        if template_profile and template_profile not in ("executive_summary", "risk_assessment", "compliance_review"):
+            return jsonify({"error": "template_profile must be one of: executive_summary|risk_assessment|compliance_review"}), 400
+            
+        custom_instructions = (request.form.get("custom_instructions") or "").strip() or None
+        output_format = (request.form.get("output_format") or "pdf").lower().strip()
+        if output_format not in ("pdf", "docx", "pptx", "teams"):
+            return jsonify({"error": "output_format must be one of: pdf|docx|pptx|teams"}), 400
+
+        # Save files to temp
+        job_id = str(uuid.uuid4())
+        temp_files = []
+        for f in files:
+            temp_path = os.path.join(app.config["UPLOAD_FOLDER"], f"{job_id}_{f.filename}")
+            f.save(temp_path)
+            temp_files.append(temp_path)
+
+        # Create job
+        with SYNTHESIS_JOBS_LOCK:
+            SYNTHESIS_JOBS[job_id] = {
+                "status": "pending",
+                "progress": 0,
+                "created_at": datetime.utcnow().isoformat(),
+                "files": temp_files,
+                "params": {
+                    "target_format": target_format,
+                    "domain_override": domain_override,
+                    "template_profile": template_profile,
+                    "custom_instructions": custom_instructions,
+                    "output_format": output_format,
+                },
+                "result": None,
+                "error": None,
+            }
+
+        # Start background thread
+        def process_synthesis():
+            try:
+                with SYNTHESIS_JOBS_LOCK:
+                    SYNTHESIS_JOBS[job_id]["status"] = "processing"
+                    SYNTHESIS_JOBS[job_id]["progress"] = 10
+
+                # Re-open files for processing
+                file_objects = []
+                for path in temp_files:
+                    file_objects.append(open(path, 'rb'))
+
+                params = SYNTHESIS_JOBS[job_id]["params"]
+                
+                # Import and run orchestrator
+                try:
+                    from synthesis.pipeline import SynthesisOrchestrator
+                except Exception:
+                    from backend.synthesis.pipeline import SynthesisOrchestrator
+
+                with SYNTHESIS_JOBS_LOCK:
+                    SYNTHESIS_JOBS[job_id]["progress"] = 20
+
+                orchestrator = SynthesisOrchestrator()
+                from synthesis.ai_service import AIServiceRouter
+                callers = [(AI_SERVICE, lambda p: call_ai_service(p))]
+                if AI_SERVICE != "openai" and OPENAI_API_KEY:
+                    callers.append(("openai", lambda p: call_openai(p)))
+                if AI_SERVICE != "anthropic" and ANTHROPIC_API_KEY:
+                    callers.append(("anthropic", lambda p: call_anthropic(p)))
+                router = AIServiceRouter(callers, min_len=80)
+
+                with SYNTHESIS_JOBS_LOCK:
+                    SYNTHESIS_JOBS[job_id]["progress"] = 40
+
+                ai_text, artifacts = orchestrator.run(
+                    files=file_objects,
+                    target_format=params["target_format"],
+                    per_file_max_chars=SYNTHESIS_PER_FILE_MAX,
+                    global_max_chars=SYNTHESIS_MAX_CHARS,
+                    ai_caller=lambda prompt: router.generate(prompt),
+                    forced_domain=params["domain_override"],
+                    template_profile=params["template_profile"],
+                    user_instructions=params["custom_instructions"],
+                )
+
+                # Close files
+                for f in file_objects:
+                    f.close()
+
+                with SYNTHESIS_JOBS_LOCK:
+                    SYNTHESIS_JOBS[job_id]["progress"] = 70
+
+                # Generate output file (reuse existing PDF/DOCX generation logic)
+                out_format = params["output_format"]
+                output_path = None
+                
+                if out_format == "pdf":
+                    # Generate PDF
+                    try:
+                        from reportlab.lib.pagesizes import LETTER
+                        from reportlab.lib.styles import getSampleStyleSheet
+                        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
+                        from reportlab.lib.units import inch
+                        from reportlab.lib.styles import ParagraphStyle
+                    except Exception as e:
+                        raise Exception(f"ReportLab not installed: {e}")
+
+                    output_path = os.path.join(app.config["UPLOAD_FOLDER"], f"synthesis_{job_id}.pdf")
+                    doc = SimpleDocTemplate(output_path, pagesize=LETTER, leftMargin=0.8*inch, rightMargin=0.8*inch, topMargin=0.8*inch, bottomMargin=0.8*inch)
+                    story = []
+
+                    styles = getSampleStyleSheet()
+                    header_style = ParagraphStyle('Header', parent=styles['Heading1'], spaceAfter=12)
+                    h2_style = ParagraphStyle('H2', parent=styles['Heading2'], spaceBefore=8, spaceAfter=6)
+                    h3_style = ParagraphStyle('H3', parent=styles['Heading3'], spaceBefore=6, spaceAfter=4)
+                    body_style = ParagraphStyle('Body', parent=styles['BodyText'], leading=14, spaceAfter=8, fontSize=11)
+                    bullet1_style = ParagraphStyle('BulletL1', parent=styles['BodyText'], leftIndent=18, spaceBefore=2)
+                    bullet2_style = ParagraphStyle('BulletL2', parent=styles['BodyText'], leftIndent=36, spaceBefore=2)
+                    bullet3_style = ParagraphStyle('BulletL3', parent=styles['BodyText'], leftIndent=54, spaceBefore=2)
+
+                    title_map = {"report": "SYNTHESIZED REPORT", "brief": "SYNTHESIZED BRIEF", "minutes": "SYNTHESIZED MINUTES"}
+                    story.append(Paragraph(title_map.get(params["target_format"], "SYNTHESIZED REPORT"), header_style))
+                    story.append(Spacer(1, 0.2*inch))
+
+                    # Parse AI text into headings, paragraphs, and bullets
+                    def esc(s: str) -> str:
+                        return s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
+                    text = ai_text.replace('\r\n', '\n')
+                    text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
+                    text = re.sub(r'(?<=[\n\.;:])\s*(?:\*|\-|\+)\s+', '\n* ', text)
+
+                    def is_h2(line: str) -> bool:
+                        l = line.strip()
+                        if len(l) < 2 or len(l) > 80:
+                            return False
+                        if l.endswith(':'):
+                            return True
+                        return bool(re.match(r'^[A-Z0-9][A-Z0-9\s\-/()&]{2,80}$', l))
+
+                    def is_h3(line: str) -> bool:
+                        l = line.strip()
+                        if len(l) < 2 or len(l) > 80:
+                            return False
+                        if is_h2(l):
+                            return False
+                        return bool(re.match(r'^(?:[A-Z][\w()\-/]*)(?:\s+(?:[A-Z][\w()\-/]*|of|and|to|for|in|on|with|the|a|an))*$', l))
+
+                    bullet_re = re.compile(r'^(?P<indent>\s*)(?:(?:[\*\-\+])|(?:\d+\.))\s+(?P<text>.+)$')
+
+                    lines = text.split('\n')
+                    paragraph_buf = []
+
+                    def flush_paragraph():
+                        if paragraph_buf:
+                            paragraph_text = ' '.join(paragraph_buf).strip()
+                            if paragraph_text:
+                                story.append(Paragraph(esc(paragraph_text), body_style))
+                            paragraph_buf.clear()
+
+                    for raw in lines:
+                        line = raw.rstrip()
+                        stripped = line.strip()
+                        if not stripped:
+                            flush_paragraph()
+                            continue
+
+                        m = bullet_re.match(line)
+                        if m:
+                            flush_paragraph()
+                            indent = m.group('indent') or ''
+                            level = 1 + min(2, len(indent) // 2)
+                            txt = m.group('text').strip()
+                            bullet_text = f"• {txt}"
+                            style = bullet1_style if level == 1 else (bullet2_style if level == 2 else bullet3_style)
+                            story.append(Paragraph(esc(bullet_text), style))
+                            continue
+
+                        if is_h2(stripped):
+                            flush_paragraph()
+                            heading = stripped[:-1].strip() if stripped.endswith(':') else stripped
+                            story.append(Paragraph(esc(heading), h2_style))
+                            continue
+                        if is_h3(stripped):
+                            flush_paragraph()
+                            story.append(Paragraph(esc(stripped), h3_style))
+                            continue
+
+                        paragraph_buf.append(stripped)
+
+                    flush_paragraph()
+                    doc.build(story)
+                    
+                elif out_format == "docx":
+                    # Generate DOCX
+                    try:
+                        from docx import Document
+                        from docx.shared import Pt, Inches
+                    except Exception as e:
+                        raise Exception(f"python-docx not installed: {e}")
+
+                    output_path = os.path.join(app.config["UPLOAD_FOLDER"], f"synthesis_{job_id}.docx")
+                    document = Document()
+                    document.add_heading(f"Synthesized {params['target_format'].capitalize()}", 0)
+                    
+                    # Simple paragraph-based rendering
+                    for line in ai_text.split('\n'):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        if line.isupper() and len(line) < 80:
+                            document.add_heading(line, level=1)
+                        elif line.startswith('- ') or line.startswith('* '):
+                            document.add_paragraph(line[2:], style='List Bullet')
+                        else:
+                            document.add_paragraph(line)
+                    
+                    document.save(output_path)
+
+                with SYNTHESIS_JOBS_LOCK:
+                    SYNTHESIS_JOBS[job_id]["status"] = "completed"
+                    SYNTHESIS_JOBS[job_id]["progress"] = 100
+                    SYNTHESIS_JOBS[job_id]["result"] = {
+                        "output_path": output_path,
+                        "artifacts": {
+                            "quality": artifacts.get("quality"),
+                            "conflicts": artifacts.get("conflicts"),
+                            "template": artifacts.get("template"),
+                        }
+                    }
+
+                # Cleanup temp files
+                for path in temp_files:
+                    try:
+                        os.remove(path)
+                    except:
+                        pass
+
+            except Exception as e:
+                with SYNTHESIS_JOBS_LOCK:
+                    SYNTHESIS_JOBS[job_id]["status"] = "failed"
+                    SYNTHESIS_JOBS[job_id]["error"] = str(e)
+
+        thread = threading.Thread(target=process_synthesis, daemon=True)
+        thread.start()
+
+        return jsonify({"job_id": job_id}), 202
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.get("/api/ai-document-synthesis/status/<job_id>")
+def get_synthesis_status(job_id: str):
+    """Get status of async synthesis job"""
+    with SYNTHESIS_JOBS_LOCK:
+        job = SYNTHESIS_JOBS.get(job_id)
+        if not job:
+            return jsonify({"error": "Job not found"}), 404
+        
+        return jsonify({
+            "job_id": job_id,
+            "status": job["status"],
+            "progress": job["progress"],
+            "error": job.get("error"),
+            "done": job["status"] in ("completed", "failed"),
+        })
+
+
+@app.get("/api/ai-document-synthesis/result/<job_id>")
+def get_synthesis_result(job_id: str):
+    """Download result of completed synthesis job"""
+    with SYNTHESIS_JOBS_LOCK:
+        job = SYNTHESIS_JOBS.get(job_id)
+        if not job:
+            return jsonify({"error": "Job not found"}), 404
+        
+        if job["status"] != "completed":
+            return jsonify({"error": "Job not completed"}), 400
+        
+        result = job.get("result")
+        if not result or not result.get("output_path"):
+            return jsonify({"error": "No result file"}), 404
+        
+        output_path = result["output_path"]
+        if not os.path.exists(output_path):
+            return jsonify({"error": "Result file not found"}), 404
+        
+        # Determine mimetype
+        ext = os.path.splitext(output_path)[1].lower()
+        mimetype_map = {
+            ".pdf": "application/pdf",
+            ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        }
+        mimetype = mimetype_map.get(ext, "application/octet-stream")
+        
+        return send_file(output_path, mimetype=mimetype, as_attachment=True, download_name=os.path.basename(output_path))
+
 
 def _fallback_extract(temp_path: str, options: ExtractionOptions) -> dict:
     """Fallback extraction logic when new pipeline is not available."""

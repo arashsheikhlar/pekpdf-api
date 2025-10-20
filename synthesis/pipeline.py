@@ -1,5 +1,6 @@
 from typing import List, Tuple, Callable, Dict, Any
 from PyPDF2 import PdfReader
+from collections import defaultdict
 import re
 import os
 
@@ -74,10 +75,23 @@ class DocumentClassifier:
     """Very lightweight heuristic classifier to tag documents by domain and topics."""
 
     KEYWORDS = {
-        "legal": ["plaintiff", "defendant", "contract", "jurisdiction", "statute", "regulation", "holding", "motion"],
-        "finance": ["revenue", "ebitda", "margin", "cash flow", "balance sheet", "income statement", "forecast", "kpi"],
+        "legal": ["plaintiff", "defendant", "contract", "jurisdiction", "statute", "regulation", "holding", "motion", "legal", "pleading"],
+        "finance": ["revenue", "ebitda", "margin", "cash flow", "balance sheet", "income statement", "forecast", "kpi", "financial"],
         "research": ["methodology", "dataset", "experiment", "hypothesis", "statistical", "significance", "results", "findings"],
         "healthcare": ["patient", "clinical", "diagnosis", "treatment", "protocol", "outcomes", "contraindication", "dose"],
+        "invoice": ["invoice", "bill to", "due date", "subtotal", "tax", "balance due", "payment terms", "vendor"],
+        "contract": ["agreement", "party", "parties", "term", "termination", "obligations", "breach", "indemnity"],
+        "purchase_order": ["purchase order", "po number", "ship to", "order date", "quantity", "unit price"],
+        "receipt": ["receipt", "purchased", "transaction", "paid", "tender", "change"],
+        "bank_statement": ["account", "balance", "transaction", "deposit", "withdrawal", "statement period"],
+        "tax_form": ["tax", "irs", "w-2", "1099", "deduction", "filing", "exemption", "taxable income"],
+        "resume": ["education", "experience", "skills", "employment", "degree", "certification"],
+        "patent": ["patent", "claim", "invention", "prior art", "embodiment", "specification"],
+        "medical_bill": ["patient", "provider", "diagnosis code", "procedure code", "insurance", "copay"],
+        "lab_report": ["specimen", "test", "result", "reference range", "abnormal", "normal"],
+        "insurance_claim": ["claim", "policy", "insured", "claimant", "coverage", "loss", "premium"],
+        "real_estate": ["property", "deed", "title", "parcel", "mortgage", "escrow", "closing"],
+        "shipping_manifest": ["shipment", "container", "tracking", "carrier", "consignee", "freight"],
     }
 
     def classify(self, documents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -96,7 +110,7 @@ class DocumentClassifier:
 
 
 class ConflictDetector:
-    """Detects simple numeric conflicts across documents for similarly-labeled facts."""
+    """Detects conflicts across documents with domain-specific rules."""
 
     NUM_RE = re.compile(r"(?P<value>[-+]?\d[\d,\.]*\s?(?:%|million|billion|bn|k|m)?|\$\s?\d[\d,\.]*)", re.IGNORECASE)
 
@@ -121,17 +135,95 @@ class ConflictDetector:
             })
         return facts
 
+    def _detect_domain_conflicts(self, documents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Domain-specific conflict detection"""
+        conflicts = []
+        
+        # Group documents by detected domain
+        by_domain = defaultdict(list)
+        for doc in documents:
+            domain = doc.get("domain", "general")
+            by_domain[domain].append(doc)
+        
+        # Invoice conflicts: duplicate invoice numbers, mismatched totals
+        if "invoice" in by_domain:
+            invoice_nums = {}
+            for doc in by_domain["invoice"]:
+                analysis = doc.get("analysis", {})
+                entities = analysis.get("entities", {})
+                inv_nums = entities.get("invoice_number", [])
+                for num in inv_nums:
+                    invoice_nums.setdefault(num, []).append(doc.get("filename"))
+            
+            for num, files in invoice_nums.items():
+                if len(files) > 1:
+                    conflicts.append({
+                        "type": "duplicate_invoice",
+                        "label": f"Duplicate invoice number: {num}",
+                        "files": files
+                    })
+        
+        # Contract conflicts: party name mismatches
+        if "contract" in by_domain:
+            parties_by_doc = {}
+            for doc in by_domain["contract"]:
+                snippet = doc.get("snippet", "")
+                # Extract party names (simple heuristic)
+                party_matches = re.findall(r"(?:party|parties)[:\s]+([A-Z][A-Za-z\s&,]+(?:Inc\.|LLC|Ltd\.|Corp\.)?)", snippet, re.IGNORECASE)
+                if party_matches:
+                    parties_by_doc[doc.get("filename")] = party_matches
+            
+            if len(parties_by_doc) > 1:
+                all_parties = set()
+                for parties in parties_by_doc.values():
+                    all_parties.update(p.strip() for p in parties)
+                
+                if len(all_parties) > len(parties_by_doc):
+                    conflicts.append({
+                        "type": "party_mismatch",
+                        "label": "Potential party name mismatches across contracts",
+                        "details": dict(parties_by_doc)
+                    })
+        
+        # Bank statement conflicts: overlapping periods with different balances
+        if "bank_statement" in by_domain:
+            periods = {}
+            for doc in by_domain["bank_statement"]:
+                analysis = doc.get("analysis", {})
+                dates = analysis.get("dates", [])
+                metrics = analysis.get("metrics", [])
+                balances = [m for m in metrics if "balance" in m.get("label", "").lower()]
+                
+                if dates and balances:
+                    period_key = f"{dates[0]}-{dates[-1]}" if len(dates) > 1 else dates[0]
+                    periods.setdefault(period_key, []).append({
+                        "file": doc.get("filename"),
+                        "balances": balances
+                    })
+            
+            for period, entries in periods.items():
+                if len(entries) > 1:
+                    conflicts.append({
+                        "type": "period_overlap",
+                        "label": f"Overlapping statement period: {period}",
+                        "entries": entries
+                    })
+        
+        return conflicts
+
     def detect(self, documents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        # Original numeric conflicts
+        numeric_conflicts = []
         all_facts: List[Dict[str, Any]] = []
         for doc in documents:
             all_facts.extend(self._extract_facts(doc))
-        # Group by label (coarse) and check for conflicting values across files
-        conflicts: List[Dict[str, Any]] = []
+        
         facts_by_label: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
         for f in all_facts:
             label = f.get("label", "value")
             val = f.get("value", "")
             facts_by_label.setdefault(label, {}).setdefault(val, []).append(f)
+        
         for label, by_val in facts_by_label.items():
             if len(by_val.keys()) > 1:
                 entries = []
@@ -140,8 +232,12 @@ class ConflictDetector:
                         "value": val,
                         "occurrences": [{"file_index": x["file_index"], "filename": x["filename"], "raw": x["raw"]} for x in facts]
                     })
-                conflicts.append({"label": label, "values": entries})
-        return conflicts
+                numeric_conflicts.append({"type": "numeric", "label": label, "values": entries})
+        
+        # Domain-specific conflicts
+        domain_conflicts = self._detect_domain_conflicts(documents)
+        
+        return numeric_conflicts + domain_conflicts
 
 
 class ProvenanceMapper:
@@ -194,6 +290,14 @@ class AdvancedDocumentAnalyzer:
         "statute": [r"\b\d+\s+U\.S\.C\.\s+\d+[a-zA-Z0-9()]*\b", r"\b\d+\s+CFR\s+\d+\.?\d*\b"],
         "email": [r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"],
         "case": [r"\b[A-Z][A-Za-z\- ]+\s+v\.\s+[A-Z][A-Za-z\- ]+\b"],
+        "invoice_number": [r"\b(?:Invoice|INV|Bill)\s*#?\s*[:.]?\s*([A-Z0-9\-]+)\b"],
+        "po_number": [r"\b(?:PO|Purchase Order)\s*#?\s*[:.]?\s*([A-Z0-9\-]+)\b"],
+        "account_number": [r"\b(?:Account|Acct)\s*#?\s*[:.]?\s*([0-9\-]+)\b"],
+        "ssn": [r"\b\d{3}-\d{2}-\d{4}\b"],
+        "ein": [r"\b\d{2}-\d{7}\b"],
+        "claim_number": [r"\b(?:Claim|CLM)\s*#?\s*[:.]?\s*([A-Z0-9\-]+)\b"],
+        "tracking_number": [r"\b[0-9]{10,30}\b"],
+        "patent_number": [r"\b(?:US|EP|WO)\s*\d{7,10}\s*[A-Z]\d?\b"],
     }
 
     NUM_RE = re.compile(r"(?P<value>[-+]?\d[\d,\.]*\s?(?:%|million|billion|bn|k|m)?|\$\s?\d[\d,\.]*)", re.IGNORECASE)
@@ -206,6 +310,18 @@ class AdvancedDocumentAnalyzer:
         "medical_report": ["patient", "diagnosis", "treatment", "medication", "dosage", "clinical", "vitals"],
         "minutes": ["meeting", "attendees", "agenda", "action items", "decisions", "next steps"],
         "email": ["from:", "to:", "subject:", "cc:", "sent:"],
+        "purchase_order": ["purchase order", "po number", "ship to", "order date", "quantity"],
+        "receipt": ["receipt", "purchased", "transaction", "paid", "tender"],
+        "bank_statement": ["account number", "statement period", "balance", "transaction", "deposit", "withdrawal"],
+        "tax_form": ["tax year", "filing status", "deduction", "exemption", "irs", "w-2", "1099"],
+        "resume": ["education", "experience", "skills", "employment history", "degree", "certification"],
+        "legal_pleading": ["plaintiff", "defendant", "court", "jurisdiction", "claim", "motion", "relief"],
+        "patent": ["patent", "claim", "invention", "prior art", "embodiment", "specification", "abstract"],
+        "medical_bill": ["patient account", "provider", "diagnosis code", "procedure code", "insurance", "copay"],
+        "lab_report": ["specimen", "test", "result", "reference range", "abnormal", "laboratory"],
+        "insurance_claim": ["claim number", "policy", "insured", "claimant", "coverage", "loss date"],
+        "real_estate": ["property", "deed", "title", "parcel", "mortgage", "escrow", "closing date"],
+        "shipping_manifest": ["shipment", "container", "tracking number", "carrier", "consignee", "freight"],
     }
 
     def extract_dates(self, text: str) -> List[str]:
@@ -340,6 +456,7 @@ class TemplateEngine:
     def _sections_for(self, domain: str, target_format: str, profile: str | None = None) -> List[str]:
         domain = domain or "general"
         fmt = target_format or "report"
+        
         # Profile-led sections override
         profile_sections: Dict[str, List[str]] = {
             "executive_summary": ["Executive Summary", "Key Points", "Implications", "Risks & Mitigations", "Recommendations"],
@@ -349,37 +466,137 @@ class TemplateEngine:
         if profile and profile in profile_sections:
             return profile_sections[profile]
 
+        # Base fallback templates
         base = {
             "report": ["Executive Summary", "Key Findings", "Detailed Analysis", "Risks & Mitigations", "Recommendations"],
             "brief": ["Executive Summary", "Key Points", "Implications", "Recommendations"],
             "minutes": ["Meeting Overview", "Attendees", "Agenda", "Decisions", "Action Items", "Next Steps"],
         }
-        legal = {
-            "report": ["Executive Summary", "Case Background", "Issues", "Arguments & Analysis", "Precedents", "Risks", "Recommendations"],
-            "brief": ["Executive Summary", "Key Issues", "Positions", "Considerations", "Recommendations"],
-            "minutes": base["minutes"],
+        
+        # Domain-specific templates
+        invoice_templates = {
+            "report": ["Executive Summary", "Document Overview", "Billing Details", "Line Items Analysis", "Totals & Taxes", "Payment Terms", "Discrepancies", "Recommendations"],
+            "brief": ["Summary", "Key Amounts", "Payment Terms", "Action Items"],
+            "minutes": ["Meeting Overview", "Attendees", "Financial Discussion", "Decisions", "Action Items", "Next Steps"],
         }
-        finance = {
-            "report": ["Executive Summary", "Performance Overview", "Financial Metrics", "Risk Assessment", "Forecasts", "Recommendations"],
-            "brief": ["Executive Summary", "KPIs", "Highlights", "Risks", "Recommendations"],
-            "minutes": base["minutes"],
+        
+        contract_templates = {
+            "report": ["Executive Summary", "Parties", "Scope & Term", "Obligations & Deliverables", "Fees & Payment", "SLAs & Performance", "Termination Clauses", "Jurisdiction & Disputes", "Risks", "Recommendations"],
+            "brief": ["Summary", "Key Terms", "Obligations", "Risks", "Recommendations"],
+            "minutes": ["Meeting Overview", "Attendees", "Contract Discussion", "Decisions", "Action Items", "Next Steps"],
         }
-        research = {
-            "report": ["Executive Summary", "Background", "Methodology", "Results", "Discussion", "Limitations", "Future Work"],
-            "brief": ["Executive Summary", "Key Findings", "Implications", "Limitations", "Next Steps"],
-            "minutes": base["minutes"],
+        
+        purchase_order_templates = {
+            "report": ["Executive Summary", "Order Overview", "Vendor Details", "Items & Quantities", "Pricing & Totals", "Delivery Terms", "Payment Terms", "Discrepancies", "Recommendations"],
+            "brief": ["Summary", "Key Items", "Totals", "Delivery Terms", "Actions"],
+            "minutes": ["Meeting Overview", "Attendees", "Order Discussion", "Decisions", "Action Items", "Next Steps"],
         }
-        healthcare = {
-            "report": ["Executive Summary", "Patient/Population", "Diagnostics", "Interventions", "Outcomes", "Safety/Compliance", "Recommendations"],
-            "brief": ["Executive Summary", "Clinical Highlights", "Risks/Safety", "Recommendations"],
-            "minutes": base["minutes"],
+        
+        receipt_templates = {
+            "report": ["Executive Summary", "Transaction Overview", "Items Purchased", "Payment Details", "Totals & Taxes", "Discrepancies", "Recommendations"],
+            "brief": ["Summary", "Total Amount", "Payment Method", "Key Items"],
+            "minutes": ["Meeting Overview", "Attendees", "Purchase Discussion", "Decisions", "Action Items", "Next Steps"],
         }
+        
+        bank_statement_templates = {
+            "report": ["Executive Summary", "Account Overview", "Statement Period", "Transactions Summary", "Deposits & Credits", "Withdrawals & Debits", "Fees & Charges", "Trends & Anomalies", "Recommendations"],
+            "brief": ["Summary", "Account Balance", "Key Transactions", "Fees", "Actions"],
+            "minutes": ["Meeting Overview", "Attendees", "Financial Review", "Decisions", "Action Items", "Next Steps"],
+        }
+        
+        tax_form_templates = {
+            "report": ["Executive Summary", "Form Overview", "Filing Information", "Income Details", "Deductions & Credits", "Tax Calculations", "Payments & Refunds", "Compliance Issues", "Recommendations"],
+            "brief": ["Summary", "Key Figures", "Deductions", "Tax Due/Refund", "Actions"],
+            "minutes": ["Meeting Overview", "Attendees", "Tax Discussion", "Decisions", "Action Items", "Next Steps"],
+        }
+        
+        resume_templates = {
+            "report": ["Executive Summary", "Candidate Overview", "Education", "Professional Experience", "Skills & Certifications", "Achievements", "Gaps & Concerns", "Recommendations"],
+            "brief": ["Summary", "Key Qualifications", "Experience", "Skills", "Recommendation"],
+            "minutes": ["Meeting Overview", "Attendees", "Candidate Discussion", "Decisions", "Action Items", "Next Steps"],
+        }
+        
+        legal_pleading_templates = {
+            "report": ["Executive Summary", "Case Background", "Parties", "Jurisdiction", "Claims & Causes of Action", "Arguments & Analysis", "Precedents", "Relief Sought", "Risks", "Recommendations"],
+            "brief": ["Summary", "Key Issues", "Positions", "Precedents", "Recommendations"],
+            "minutes": ["Meeting Overview", "Attendees", "Case Discussion", "Decisions", "Action Items", "Next Steps"],
+        }
+        
+        patent_templates = {
+            "report": ["Executive Summary", "Invention Overview", "Technical Field", "Background Art", "Claims Analysis", "Embodiments", "Novelty Assessment", "Prior Art Concerns", "Recommendations"],
+            "brief": ["Summary", "Key Claims", "Novelty", "Prior Art", "Recommendations"],
+            "minutes": ["Meeting Overview", "Attendees", "Patent Discussion", "Decisions", "Action Items", "Next Steps"],
+        }
+        
+        medical_bill_templates = {
+            "report": ["Executive Summary", "Patient Information", "Provider Details", "Services & Procedures", "Diagnosis Codes", "Charges Breakdown", "Insurance Coverage", "Patient Responsibility", "Discrepancies", "Recommendations"],
+            "brief": ["Summary", "Total Charges", "Insurance Coverage", "Patient Owes", "Actions"],
+            "minutes": ["Meeting Overview", "Attendees", "Billing Discussion", "Decisions", "Action Items", "Next Steps"],
+        }
+        
+        lab_report_templates = {
+            "report": ["Executive Summary", "Patient & Specimen Info", "Tests Performed", "Results Summary", "Abnormal Findings", "Reference Ranges", "Clinical Significance", "Follow-up Needed", "Recommendations"],
+            "brief": ["Summary", "Key Results", "Abnormalities", "Clinical Significance", "Actions"],
+            "minutes": ["Meeting Overview", "Attendees", "Results Discussion", "Decisions", "Action Items", "Next Steps"],
+        }
+        
+        insurance_claim_templates = {
+            "report": ["Executive Summary", "Claim Overview", "Policy Details", "Insured & Claimant", "Loss Description", "Coverage Analysis", "Claim Amount", "Adjustments", "Disputes", "Recommendations"],
+            "brief": ["Summary", "Claim Amount", "Coverage", "Disputes", "Actions"],
+            "minutes": ["Meeting Overview", "Attendees", "Claim Discussion", "Decisions", "Action Items", "Next Steps"],
+        }
+        
+        real_estate_templates = {
+            "report": ["Executive Summary", "Property Overview", "Legal Description", "Ownership & Title", "Liens & Encumbrances", "Zoning & Use", "Transaction Terms", "Risks", "Recommendations"],
+            "brief": ["Summary", "Property Details", "Title Status", "Key Terms", "Actions"],
+            "minutes": ["Meeting Overview", "Attendees", "Property Discussion", "Decisions", "Action Items", "Next Steps"],
+        }
+        
+        shipping_manifest_templates = {
+            "report": ["Executive Summary", "Shipment Overview", "Carrier Details", "Contents & Quantities", "Origin & Destination", "Tracking Information", "Special Instructions", "Discrepancies", "Recommendations"],
+            "brief": ["Summary", "Contents", "Tracking", "Destination", "Actions"],
+            "minutes": ["Meeting Overview", "Attendees", "Shipment Discussion", "Decisions", "Action Items", "Next Steps"],
+        }
+        
+        # Map domains to templates
         by_domain = {
-            "legal": legal,
-            "finance": finance,
-            "research": research,
-            "healthcare": healthcare,
+            "invoice": invoice_templates,
+            "contract": contract_templates,
+            "purchase_order": purchase_order_templates,
+            "receipt": receipt_templates,
+            "bank_statement": bank_statement_templates,
+            "tax_form": tax_form_templates,
+            "resume": resume_templates,
+            "legal_pleading": legal_pleading_templates,
+            "legal": legal_pleading_templates,  # Alias
+            "patent": patent_templates,
+            "medical_bill": medical_bill_templates,
+            "lab_report": lab_report_templates,
+            "insurance_claim": insurance_claim_templates,
+            "real_estate": real_estate_templates,
+            "shipping_manifest": shipping_manifest_templates,
+            "financial": {  # Alias to finance
+                "report": ["Executive Summary", "Performance Overview", "Financial Metrics", "Risk Assessment", "Forecasts", "Recommendations"],
+                "brief": ["Summary", "KPIs", "Highlights", "Risks", "Recommendations"],
+                "minutes": ["Meeting Overview", "Attendees", "Financial Discussion", "Decisions", "Action Items", "Next Steps"],
+            },
+            "finance": {
+                "report": ["Executive Summary", "Performance Overview", "Financial Metrics", "Risk Assessment", "Forecasts", "Recommendations"],
+                "brief": ["Summary", "KPIs", "Highlights", "Risks", "Recommendations"],
+                "minutes": ["Meeting Overview", "Attendees", "Financial Discussion", "Decisions", "Action Items", "Next Steps"],
+            },
+            "research": {
+                "report": ["Executive Summary", "Background", "Methodology", "Results", "Discussion", "Limitations", "Future Work"],
+                "brief": ["Summary", "Key Findings", "Implications", "Limitations", "Next Steps"],
+                "minutes": ["Meeting Overview", "Attendees", "Research Discussion", "Decisions", "Action Items", "Next Steps"],
+            },
+            "healthcare": {
+                "report": ["Executive Summary", "Patient/Population", "Diagnostics", "Interventions", "Outcomes", "Safety/Compliance", "Recommendations"],
+                "brief": ["Summary", "Clinical Highlights", "Risks/Safety", "Recommendations"],
+                "minutes": ["Meeting Overview", "Attendees", "Clinical Discussion", "Decisions", "Action Items", "Next Steps"],
+            },
         }
+        
         if domain in by_domain and fmt in by_domain[domain]:
             return by_domain[domain][fmt]
         return base.get(fmt, base["report"])
@@ -462,16 +679,92 @@ class QualityPipeline:
         ratio = matched / len(nums) if nums else 1.0
         return {"numbers": len(nums), "matched": matched, "match_ratio": round(ratio, 3)}
 
+    def domain_specific_quality(self, ai_text: str, documents: List[Dict[str, Any]], template: Dict[str, any]) -> Dict[str, any]:
+        """Domain-specific quality checks"""
+        domain = template.get("domain", "general")
+        checks = {}
+        
+        # Invoice domain: check for totals, dates, vendor info
+        if domain == "invoice":
+            has_total = bool(re.search(r"(?:total|amount due|balance)[:\s]+\$?\d+", ai_text, re.IGNORECASE))
+            has_vendor = bool(re.search(r"(?:vendor|supplier|from)[:\s]+[A-Z]", ai_text, re.IGNORECASE))
+            has_date = bool(re.search(r"(?:date|due date|invoice date)", ai_text, re.IGNORECASE))
+            checks = {
+                "has_total": has_total,
+                "has_vendor": has_vendor,
+                "has_date": has_date,
+                "score": (has_total + has_vendor + has_date) / 3.0
+            }
+        
+        # Contract domain: check for parties, terms, obligations
+        elif domain == "contract":
+            has_parties = bool(re.search(r"(?:parties|party)[:\s]", ai_text, re.IGNORECASE))
+            has_term = bool(re.search(r"(?:term|duration|period)[:\s]", ai_text, re.IGNORECASE))
+            has_obligations = bool(re.search(r"(?:obligation|deliverable|responsibility)", ai_text, re.IGNORECASE))
+            checks = {
+                "has_parties": has_parties,
+                "has_term": has_term,
+                "has_obligations": has_obligations,
+                "score": (has_parties + has_term + has_obligations) / 3.0
+            }
+        
+        # Legal domain: check for jurisdiction, claims, relief
+        elif domain in ("legal", "legal_pleading"):
+            has_jurisdiction = bool(re.search(r"jurisdiction", ai_text, re.IGNORECASE))
+            has_claims = bool(re.search(r"(?:claim|cause of action)", ai_text, re.IGNORECASE))
+            has_relief = bool(re.search(r"(?:relief|remedy|damages)", ai_text, re.IGNORECASE))
+            checks = {
+                "has_jurisdiction": has_jurisdiction,
+                "has_claims": has_claims,
+                "has_relief": has_relief,
+                "score": (has_jurisdiction + has_claims + has_relief) / 3.0
+            }
+        
+        # Medical domain: check for patient info, diagnosis, treatment
+        elif domain in ("medical_bill", "lab_report", "healthcare"):
+            has_patient = bool(re.search(r"patient", ai_text, re.IGNORECASE))
+            has_diagnosis = bool(re.search(r"diagnosis|condition", ai_text, re.IGNORECASE))
+            has_treatment = bool(re.search(r"(?:treatment|procedure|medication)", ai_text, re.IGNORECASE))
+            checks = {
+                "has_patient": has_patient,
+                "has_diagnosis": has_diagnosis,
+                "has_treatment": has_treatment,
+                "score": (has_patient + has_diagnosis + has_treatment) / 3.0
+            }
+        
+        # Default: basic completeness check
+        else:
+            word_count = len(ai_text.split())
+            has_summary = bool(re.search(r"(?:summary|overview)", ai_text, re.IGNORECASE))
+            has_recommendations = bool(re.search(r"recommendation", ai_text, re.IGNORECASE))
+            checks = {
+                "word_count": word_count,
+                "has_summary": has_summary,
+                "has_recommendations": has_recommendations,
+                "score": min(1.0, word_count / 500.0) * 0.5 + (has_summary + has_recommendations) / 2.0 * 0.5
+            }
+        
+        return checks
+
     def evaluate(self, ai_text: str, documents: List[Dict[str, any]], template: Dict[str, any], provenance: any) -> Dict[str, any]:
         outline = self.outline_coverage(ai_text, template or {})
         prov = self.provenance_coverage(provenance)
         numeric = self.numeric_alignment(ai_text, documents)
-        # Simple overall score (weighted)
-        overall = 0.5 * outline.get("coverage", 0) + 0.3 * prov.get("coverage", 0) + 0.2 * numeric.get("match_ratio", 0)
+        domain_quality = self.domain_specific_quality(ai_text, documents, template or {})
+        
+        # Weighted overall score
+        overall = (
+            0.4 * outline.get("coverage", 0) + 
+            0.2 * prov.get("coverage", 0) + 
+            0.2 * numeric.get("match_ratio", 0) +
+            0.2 * domain_quality.get("score", 0)
+        )
+        
         return {
             "outline": outline,
             "provenance": prov,
             "numeric": numeric,
+            "domain_specific": domain_quality,
             "overall_score": round(overall, 3)
         }
 
