@@ -1,8 +1,9 @@
 services:
   - type: web
-    name: simurghpdf-api
+    name: perkpdf-api
     runtime: python
     pythonVersion: "3.11.7"
+    region: frankfurt
     buildCommand: |
       pip install --upgrade pip setuptools wheel
       pip install -r requirements.txt
