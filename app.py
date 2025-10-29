@@ -15,8 +15,16 @@ from flask import (
     Flask, request, send_file, jsonify, after_this_request
 )
 from flask_cors import CORS                 # allow front-end origin
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from werkzeug.utils import secure_filename
-from PyPDF2 import PdfMerger, PdfReader, PdfWriter   # ← PdfReader/Writer for split
+from validators import (
+    ChatRequestSchema, ExtractRequestSchema, PageRangeSchema,
+    ExplainRequestSchema, SummarizeRequestSchema
+)
+from marshmallow import ValidationError
+from common.security import detect_pii, redact_pii
+from PyPDF2 import PdfMerger, PdfReader, PdfWriter, PdfReadError   # ← PdfReader/Writer for split
 from datetime import datetime, timedelta
 import mimetypes, os, uuid, io, re, zipfile
 import subprocess, shlex          # run Ghostscript
@@ -31,7 +39,27 @@ import sys
 import threading
 import hashlib
 import time
+import logging
 from collections import defaultdict
+try:
+    import magic
+    MAGIC_AVAILABLE = True
+except ImportError:
+    MAGIC_AVAILABLE = False
+    print("Warning: python-magic not available. File type validation will be limited.")
+
+# ── Logging Configuration ──────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('error.log'),
+        logging.StreamHandler()
+    ]
+)
+error_logger = logging.getLogger('errors')
+error_logger.setLevel(logging.ERROR)
+
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, ListFlowable, ListItem
@@ -110,19 +138,21 @@ OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "4096"))
 SYNTHESIS_PER_FILE_MAX = int(os.getenv("SYNTHESIS_PER_FILE_MAX", "1200"))
 SYNTHESIS_MAX_CHARS = int(os.getenv("SYNTHESIS_MAX_CHARS", "8000"))
 
-# Print configuration at startup for debugging
-print("=== AI SERVICE CONFIGURATION ===")
-print(f"AI_SERVICE: {AI_SERVICE}")
-print(f"ANTHROPIC_API_KEY: {'SET' if ANTHROPIC_API_KEY else 'NOT SET'}")
-print(f"ANTHROPIC_MODEL: {ANTHROPIC_MODEL}")
-print(f"OPENAI_API_KEY: {'SET' if OPENAI_API_KEY else 'NOT SET'}")
-print(f"OPENAI_MODEL: {OPENAI_MODEL}")
-print(f"OLLAMA_BASE_URL: {OLLAMA_BASE_URL}")
-print(f"OLLAMA_MODEL: {OLLAMA_MODEL}")
-print("================================")
+# Validate required environment variables at startup
+required_keys = []
+if AI_SERVICE == "anthropic" and not ANTHROPIC_API_KEY:
+    required_keys.append("ANTHROPIC_API_KEY")
+elif AI_SERVICE == "openai" and not OPENAI_API_KEY:
+    required_keys.append("OPENAI_API_KEY")
 
-# Force flush to ensure logs are visible
-sys.stdout.flush()
+if required_keys:
+    error_logger.error(f"Missing required environment variables: {', '.join(required_keys)}")
+    print(f"ERROR: Missing required environment variables. Check configuration.")
+    sys.exit(1)
+
+# Log configuration status (without revealing keys)
+error_logger.info(f"AI_SERVICE: {AI_SERVICE}")
+error_logger.info(f"AI configuration loaded successfully")
 
 # Valid Anthropic models for validation
 VALID_ANTHROPIC_MODELS = [
@@ -822,47 +852,263 @@ CORS(
     resources={r"/api/*": {"origins": origins}}
 )
 
+# ── Rate Limiting ──────────────────────────────────────────────
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    default_limits=["200 per day", "50 per hour"],
+    storage_uri="memory://"
+)
+
+# ── Security Headers ───────────────────────────────────────────
+@app.after_request
+def set_security_headers(response):
+    """Add security headers to all responses."""
+    response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self' 'unsafe-inline' cdnjs.cloudflare.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self' https://api.openai.com https://api.anthropic.com;"
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    response.headers['Permissions-Policy'] = 'camera=(), microphone=(), geolocation=()'
+    return response
+
 
 # ── config & housekeeping ───────────────────────────────────────
 app.config["UPLOAD_FOLDER"]      = "temp"
 app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024    # 100 MB
 os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
 
+# Request size validation constants
+MAX_FILES_PER_REQUEST = int(os.getenv("MAX_FILES_PER_REQUEST", "10"))
+MAX_TOTAL_REQUEST_SIZE = int(os.getenv("MAX_TOTAL_REQUEST_SIZE", "500")) * 1024 * 1024  # 500MB default
+
+def validate_request_size(files):
+    """
+    Validate request size limits.
+    Returns: (is_valid: bool, error_message: str or None)
+    """
+    if len(files) > MAX_FILES_PER_REQUEST:
+        return False, f"Too many files. Maximum {MAX_FILES_PER_REQUEST} files per request."
+    
+    total_size = sum(f.content_length or 0 for f in files if hasattr(f, 'content_length'))
+    if total_size > MAX_TOTAL_REQUEST_SIZE:
+        return False, f"Total request size too large. Maximum {MAX_TOTAL_REQUEST_SIZE // (1024*1024)}MB total."
+    
+    return True, None
+
+def sanitize_csv_cell(value):
+    """
+    Sanitize CSV cell values to prevent formula injection.
+    Prefixes dangerous characters (=, +, -, @, tab) with a single quote.
+    """
+    if not isinstance(value, str):
+        value = str(value)
+    
+    # Check for formula injection patterns
+    dangerous_starters = ['=', '+', '-', '@', '\t']
+    if value and value[0] in dangerous_starters:
+        # Prefix with single quote to disable formula execution
+        return "'" + value
+    return value
+
+def sanitize_prompt_input(user_input: str, max_length: int = 2000) -> str:
+    """
+    Sanitize user input to prevent prompt injection attacks.
+    - Removes system prompt injection attempts
+    - Limits length
+    - Escapes special characters that might break prompts
+    """
+    if not isinstance(user_input, str):
+        return ""
+    
+    # Limit length
+    user_input = user_input[:max_length]
+    
+    # Remove potential system prompt injection attempts
+    injection_patterns = [
+        r'```system',
+        r'```\s*system',
+        r'<\|system\|>',
+        r'###\s*system',
+        r'#\s*system\s*prompt',
+        r'ignore\s+previous\s+instructions',
+        r'forget\s+all\s+previous',
+    ]
+    import re
+    for pattern in injection_patterns:
+        user_input = re.sub(pattern, '', user_input, flags=re.IGNORECASE)
+    
+    # Remove any null bytes and control characters (except newlines/tabs for formatting)
+    user_input = ''.join(char for char in user_input if ord(char) >= 32 or char in '\n\t' or ord(char) == 10 or ord(char) == 9)
+    
+    # Prefix to clearly distinguish user input from instructions
+    return f"User question: {user_input.strip()}"
+
+def with_timeout(seconds=300):
+    """
+    Decorator to add timeout to Flask endpoints.
+    Uses threading to run the function with a timeout.
+    Note: This doesn't actually kill the thread, but returns an error if timeout occurs.
+    For true timeout enforcement, consider using WSGI server timeouts (gunicorn, uwsgi).
+    """
+    from functools import wraps
+    import threading
+    
+    def decorator(f):
+        @wraps(f)
+        def wrapper(*args, **kwargs):
+            result = [None]
+            exception = [None]
+            
+            def target():
+                try:
+                    result[0] = f(*args, **kwargs)
+                except Exception as e:
+                    exception[0] = e
+            
+            thread = threading.Thread(target=target)
+            thread.daemon = True
+            thread.start()
+            thread.join(timeout=seconds)
+            
+            if thread.is_alive():
+                # Thread is still running - timeout occurred
+                # Note: Thread continues running but we return error
+                error_logger.warning(f"Request timeout after {seconds}s for {f.__name__}")
+                return jsonify({"error": f"Request timed out after {seconds} seconds"}), 504
+            
+            if exception[0]:
+                raise exception[0]
+            
+            return result[0]
+        
+        return wrapper
+    return decorator
+
 def purge_old_files(hours: int = 12):
     """Delete temp files older than <hours>."""
     cutoff = datetime.utcnow() - timedelta(hours=hours)
-    for fname in os.listdir(app.config["UPLOAD_FOLDER"]):
-        path = os.path.join(app.config["UPLOAD_FOLDER"], fname)
-        if os.path.isfile(path) and datetime.utcfromtimestamp(
-                os.path.getmtime(path)) < cutoff:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
+    deleted_count = 0
+    errors = []
+    
+    try:
+        for fname in os.listdir(app.config["UPLOAD_FOLDER"]):
+            path = os.path.join(app.config["UPLOAD_FOLDER"], fname)
+            if os.path.isfile(path):
+                try:
+                    file_time = datetime.utcfromtimestamp(os.path.getmtime(path))
+                    if file_time < cutoff:
+                        os.remove(path)
+                        deleted_count += 1
+                except (OSError, PermissionError) as e:
+                    # File might be locked - log and continue
+                    errors.append(str(e))
+                    error_logger.warning(f"Could not delete temp file {fname}: {e}")
+        if deleted_count > 0:
+            error_logger.info(f"Cleaned up {deleted_count} old temp files")
+    except Exception as e:
+        error_logger.error(f"Error during temp file cleanup: {e}", exc_info=True)
+
+# Initial cleanup
 purge_old_files()
+
+# Schedule periodic cleanup (every hour)
+def schedule_cleanup():
+    """Run cleanup every hour."""
+    while True:
+        time.sleep(3600)  # 1 hour
+        purge_old_files()
+
+# Start cleanup thread in background
+cleanup_thread = threading.Thread(target=schedule_cleanup, daemon=True)
+cleanup_thread.start()
+
+# Register cleanup on exit
+import atexit
+atexit.register(purge_old_files)
 # ─────────────────────────────────────────────────────────────────
 
 def allowed_pdf(fileobj):
-    """Lenient PDF check: just check extension and MIME type."""
+    """Secure PDF validation: check extension, MIME type, and magic bytes."""
     if not fileobj.filename:
         return False
     
+    # Check extension
     ext = fileobj.filename.lower().endswith(".pdf")
+    
+    # Check MIME type
     mime = fileobj.mimetype == "application/pdf"
     
-    # Accept if either extension OR MIME type indicates PDF
-    return ext or mime
+    # Check magic bytes - first 4 bytes must be %PDF
+    try:
+        fileobj.seek(0)
+        header = fileobj.read(4)
+        fileobj.seek(0)  # Reset for later use
+        magic_bytes_ok = header == b'%PDF'
+    except Exception:
+        magic_bytes_ok = False
+    
+    # If magic library is available, use it for additional verification
+    mime_magic_ok = True
+    if MAGIC_AVAILABLE:
+        try:
+            fileobj.seek(0)
+            content = fileobj.read(1024)
+            fileobj.seek(0)
+            detected_mime = magic.from_buffer(content, mime=True)
+            mime_magic_ok = detected_mime == 'application/pdf'
+        except Exception:
+            pass  # Fallback to other checks
+    
+    # Require extension AND (MIME OR magic bytes) AND (magic library check if available)
+    return ext and (mime or magic_bytes_ok) and mime_magic_ok
 
 def allowed_image(fileobj):
     """
-    Accept only JPG/JPEG/PNG uploads:
-      • filename must end in .jpg/.jpeg/.png
-      • mimetype must start with "image/"
+    Secure image validation: check extension, MIME type, and magic bytes.
+    Accept only JPG/JPEG/PNG uploads.
     """
+    if not fileobj.filename:
+        return False
+    
     fname = fileobj.filename.lower()
     ext_ok = fname.endswith(".jpg") or fname.endswith(".jpeg") or fname.endswith(".png")
     mime_ok = fileobj.mimetype.startswith("image/")
-    return ext_ok and mime_ok
+    
+    # Check magic bytes
+    magic_bytes_ok = False
+    try:
+        fileobj.seek(0)
+        header = fileobj.read(4)
+        fileobj.seek(0)  # Reset for later use
+        # JPG starts with FF D8 FF
+        # PNG starts with 89 50 4E 47
+        if fname.endswith(".jpg") or fname.endswith(".jpeg"):
+            magic_bytes_ok = header[:3] == b'\xFF\xD8\xFF'
+        elif fname.endswith(".png"):
+            magic_bytes_ok = header == b'\x89PNG'
+    except Exception:
+        pass
+    
+    # If magic library is available, use it for additional verification
+    mime_magic_ok = True
+    if MAGIC_AVAILABLE:
+        try:
+            fileobj.seek(0)
+            content = fileobj.read(1024)
+            fileobj.seek(0)
+            detected_mime = magic.from_buffer(content, mime=True)
+            mime_magic_ok = detected_mime.startswith('image/')
+            if fname.endswith(".png"):
+                mime_magic_ok = mime_magic_ok and 'png' in detected_mime.lower()
+            elif fname.endswith(".jpg") or fname.endswith(".jpeg"):
+                mime_magic_ok = mime_magic_ok and 'jpeg' in detected_mime.lower()
+        except Exception:
+            pass  # Fallback to other checks
+    
+    # Require extension AND MIME AND magic bytes AND (magic library check if available)
+    return ext_ok and mime_ok and magic_bytes_ok and mime_magic_ok
 
 # -------------------------
 def gs_executable():
@@ -1010,6 +1256,7 @@ def convert_formats():
 
 
 @app.post("/api/convert")
+@limiter.limit("15 per minute")
 def convert_unified():
     """
     Unified conversion endpoint.
@@ -1075,9 +1322,14 @@ def convert_unified():
                 with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
                     for (pnum, tidx, raw_table) in tables_found:
                         if len(raw_table) > 1:
-                            df = pd.DataFrame(raw_table[1:], columns=raw_table[0])
+                            # Sanitize headers and data to prevent CSV/Excel injection
+                            sanitized_header = [sanitize_csv_cell(str(col)) for col in raw_table[0]]
+                            sanitized_rows = [[sanitize_csv_cell(str(cell)) for cell in row] for row in raw_table[1:]]
+                            df = pd.DataFrame(sanitized_rows, columns=sanitized_header)
                         else:
-                            df = pd.DataFrame(raw_table)
+                            # single-row table → no header inference
+                            sanitized_row = [sanitize_csv_cell(str(cell)) for cell in raw_table[0]]
+                            df = pd.DataFrame([sanitized_row])
                         sheet_name = f"page{pnum}_tbl{tidx}"
                         df.to_excel(writer, sheet_name=sheet_name, index=False)
             else:
@@ -1094,7 +1346,9 @@ def convert_unified():
                     lines = txt_str.split("\n") if txt_str else []
 
                 with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
-                    df_txt = pd.DataFrame({"line": lines})
+                    # Sanitize text lines to prevent CSV injection
+                    sanitized_lines = [sanitize_csv_cell(line) for line in lines]
+                    df_txt = pd.DataFrame({"line": sanitized_lines})
                     df_txt.to_excel(writer, sheet_name="text", index=False)
 
             @after_this_request
@@ -1195,11 +1449,18 @@ def convert_unified():
 
 
 @app.post("/api/merge")
+@limiter.limit("10 per minute")
+@with_timeout(180)  # 180 seconds for PDF processing
 def merge_pdfs():
     """Merge uploaded PDFs and return the merged file."""
     files = request.files.getlist("files")
     if len(files) < 2:
         return jsonify(error="Select at least two PDF files"), 400
+    
+    # Validate request size
+    is_valid, error_msg = validate_request_size(files)
+    if not is_valid:
+        return jsonify(error=error_msg), 400
 
     merger, temp_paths = PdfMerger(), []
 
@@ -1212,7 +1473,33 @@ def merge_pdfs():
         )
         f.save(save_path)
         temp_paths.append(save_path)
-        merger.append(save_path)
+        try:
+            # Validate each PDF before merging
+            test_reader = PdfReader(save_path)
+            if len(test_reader.pages) > 10000:
+                raise ValueError(f"PDF has too many pages")
+            merger.append(save_path)
+        except PdfReadError as e:
+            error_logger.warning(f"PdfReadError in merge for {save_path}: {str(e)}")
+            # Cleanup temp files
+            for path in temp_paths:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            return jsonify(error=f"Invalid or corrupted PDF: {secure_filename(f.filename)}"), 400
+        except Exception as e:
+            error_logger.warning(f"PDF validation error in merge: {str(e)}")
+            # Cleanup temp files
+            for path in temp_paths:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            error_msg = "One or more PDF files are invalid"
+            if app.config.get('DEBUG'):
+                error_msg = f"PDF validation failed: {str(e)}"
+            return jsonify(error=error_msg), 400
 
     out_path = os.path.join(
         app.config["UPLOAD_FOLDER"], f"merged_{uuid.uuid4()}.pdf"
@@ -1241,6 +1528,8 @@ def merge_pdfs():
 
 # ── SPLIT ───────────────────────────────────────────
 @app.post("/api/split")
+@limiter.limit("10 per minute")
+@with_timeout(180)  # 180 seconds for PDF processing
 def split_pdf():
     """
     Accept exactly ONE PDF and an optional form field 'pages'
@@ -1264,7 +1553,30 @@ def split_pdf():
 
     # figure out page range
     pages_req = request.form.get("pages", "").strip()  # e.g. "2-5"
-    reader = PdfReader(src_path)
+    try:
+        reader = PdfReader(src_path)
+        # Validate PDF structure
+        num_pages = len(reader.pages)
+        if num_pages > 10000:
+            os.remove(src_path)
+            return jsonify(error=f"PDF has too many pages (max 10000)"), 400
+        if num_pages < 1:
+            os.remove(src_path)
+            return jsonify(error="Invalid PDF: no pages found"), 400
+    except PdfReadError as e:
+        os.remove(src_path)
+        error_logger.warning(f"PdfReadError in split: {str(e)}")
+        error_msg = "Invalid or corrupted PDF file"
+        if app.config.get('DEBUG'):
+            error_msg = f"Cannot read PDF: {str(e)}"
+        return jsonify(error=error_msg), 400
+    except Exception as e:
+        os.remove(src_path)
+        error_logger.warning(f"PDF read error in split: {str(e)}")
+        error_msg = "Invalid or corrupted PDF file"
+        if app.config.get('DEBUG'):
+            error_msg = f"Cannot read PDF: {str(e)}"
+        return jsonify(error=error_msg), 400
     writer = PdfWriter()
 
     if pages_req:
@@ -1309,6 +1621,8 @@ def split_pdf():
 
 # ── COMPRESS  ────────────────────────
 @app.post("/api/compress")
+@limiter.limit("10 per minute")
+@with_timeout(180)  # 180 seconds for PDF processing
 def compress_pdf():
     """
     Accept ONE PDF + optional 'quality' field:
@@ -1338,7 +1652,22 @@ def compress_pdf():
     if not gs_bin:
         return jsonify(error="Ghostscript not installed"), 500
     
-    # Ghostscript command
+    # Validate file paths to prevent command injection
+    if not os.path.abspath(in_path).startswith(os.path.abspath(app.config["UPLOAD_FOLDER"])):
+        os.remove(in_path)
+        return jsonify(error="Invalid file path"), 400
+    
+    if not os.path.abspath(out_path).startswith(os.path.abspath(app.config["UPLOAD_FOLDER"])):
+        os.remove(in_path)
+        return jsonify(error="Invalid output path"), 400
+    
+    # Validate paths don't contain command injection characters
+    dangerous_chars = [';', '&', '|', '`', '$', '(', ')', '<', '>', '\n', '\r']
+    if any(char in in_path or char in out_path for char in dangerous_chars):
+        os.remove(in_path)
+        return jsonify(error="Invalid characters in file path"), 400
+    
+    # Ghostscript command - using list (no shell=True) for security
     gs_cmd = [
         gs_bin,
         "-sDEVICE=pdfwrite",
@@ -1349,7 +1678,15 @@ def compress_pdf():
         in_path,
     ]
 
-    subprocess.run(gs_cmd, check=True)
+    # Add timeout to prevent hanging processes
+    try:
+        subprocess.run(gs_cmd, check=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        os.remove(in_path)
+        return jsonify(error="Processing timeout"), 500
+    except subprocess.CalledProcessError as e:
+        os.remove(in_path)
+        return jsonify(error="PDF compression failed"), 500
 
     # cleanup originals after send
     @after_this_request
@@ -1366,6 +1703,8 @@ def compress_pdf():
 
 # ── PDF→Word  ────────────────────────────────────────
 @app.post("/api/pdf-to-word")
+@limiter.limit("15 per minute")
+@with_timeout(180)  # 180 seconds for PDF processing
 def pdf_to_word():
     """
     Convert ONE PDF to a .docx file.
@@ -1415,6 +1754,7 @@ def pdf_to_word():
 
 # ── Route: Images → PDF ─────────────────────────────────────────────────────────
 @app.post("/api/images-to-pdf")
+@limiter.limit("15 per minute")
 def images_to_pdf():
     """
     Accept one or more JPG/PNG files and bundle them into a single PDF.
@@ -1474,6 +1814,7 @@ def images_to_pdf():
 
 # ── Route: PDF → Images ─────────────────────────────────────────────────────────
 @app.post("/api/pdf-to-images")
+@limiter.limit("15 per minute")
 def pdf_to_images():
     """
     Accept exactly one PDF and return a ZIP of PNGs (one per page).
@@ -1535,6 +1876,7 @@ def pdf_to_images():
 
 # ── Route: PDF → Text ─────────────────────────────────────────────────────────
 @app.post("/api/pdf-to-text")
+@limiter.limit("15 per minute")
 def pdf_to_text():
     """
     Accept exactly one PDF file, extract all textual content, and return
@@ -1585,6 +1927,8 @@ def pdf_to_text():
 
 # ── Route: PDF → Excel ─────────────────────────────────────────────────────────
 @app.post("/api/pdf-to-excel")
+@limiter.limit("15 per minute")
+@with_timeout(180)  # 180 seconds for PDF processing
 def pdf_to_excel():
     """
     1) Accept exactly one PDF upload.
@@ -1635,10 +1979,14 @@ def pdf_to_excel():
                 # Convert raw_table (list of rows) → DataFrame
                 if len(raw_table) > 1:
                     # treat first row as header
-                    df = pd.DataFrame(raw_table[1:], columns=raw_table[0])
+                    # Sanitize headers and data to prevent CSV/Excel injection
+                    sanitized_header = [sanitize_csv_cell(str(col)) for col in raw_table[0]]
+                    sanitized_rows = [[sanitize_csv_cell(str(cell)) for cell in row] for row in raw_table[1:]]
+                    df = pd.DataFrame(sanitized_rows, columns=sanitized_header)
                 else:
                     # single-row table → no header inference
-                    df = pd.DataFrame(raw_table)
+                    sanitized_row = [sanitize_csv_cell(str(cell)) for cell in raw_table[0]]
+                    df = pd.DataFrame([sanitized_row])
 
                 sheet_name = f"page{pnum}_tbl{tidx}"
                 # pandas will auto-create the sheet
@@ -1666,8 +2014,10 @@ def pdf_to_excel():
             txt_lines = txt_str.split("\n") if txt_str else []
 
         # Write text lines into an Excel file to ensure .xlsx output consistently
+        # Sanitize text lines to prevent CSV injection
+        sanitized_lines = [sanitize_csv_cell(line) for line in txt_lines]
         with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
-            df_txt = pd.DataFrame({"line": txt_lines})
+            df_txt = pd.DataFrame({"line": sanitized_lines})
             df_txt.to_excel(writer, sheet_name="text", index=False)
 
         download_name = "extracted_text.xlsx"
@@ -1694,6 +2044,8 @@ def pdf_to_excel():
 
 # ── Route: OCR PDF ─────────────────────────────────────────────────────────
 @app.post("/api/ocr-pdf")
+@limiter.limit("15 per minute")
+@with_timeout(600)  # 600 seconds for OCR (longer operation)
 def ocr_pdf():
     """
     OCR PDF endpoint:
@@ -2199,6 +2551,7 @@ def pdf_to_peppol():
 
 # ── Route: Delete pages ─────────────────────────────────────────────────────────
 @app.post("/api/delete-pages")
+@limiter.limit("10 per minute")
 def delete_pages():
     """
     Delete Pages endpoint:
@@ -2227,20 +2580,37 @@ def delete_pages():
         reader = PdfReader(in_path)
     except Exception as e:
         os.remove(in_path)
-        return jsonify(error=f"Cannot read PDF: {e}"), 400
+        # Check if it's a PDF-specific error
+        error_msg = "Invalid or corrupted PDF file"
+        if app.config.get('DEBUG'):
+            error_msg = f"Cannot read PDF: {str(e)}"
+        return jsonify(error=error_msg), 400
 
     num_pages = len(reader.pages)
+    
+    # Validate PDF structure
+    MAX_PAGES = 10000
+    if num_pages > MAX_PAGES:
+        os.remove(in_path)
+        return jsonify(error=f"PDF has too many pages (max {MAX_PAGES})"), 400
+    if num_pages < 1:
+        os.remove(in_path)
+        return jsonify(error="Invalid PDF: no pages found"), 400
+    
     # Parse delete_str → zero-based indices
     try:
         delete_idxs = sorted({int(x) - 1 for x in delete_str.split(",")})
-    except ValueError:
+        # Validate page numbers are within bounds
+        if any(not isinstance(idx, int) or idx < 0 or idx >= num_pages for idx in delete_idxs):
+            os.remove(in_path)
+            return jsonify(error="Delete page out of range"), 400
+        # Validate no integer overflow
+        if any(idx > sys.maxsize for idx in delete_idxs):
+            os.remove(in_path)
+            return jsonify(error="Invalid page number"), 400
+    except (ValueError, OverflowError) as e:
         os.remove(in_path)
         return jsonify(error="Invalid delete format. Use e.g. 2,5,7"), 400
-
-    # Validate range
-    if any(idx < 0 or idx >= num_pages for idx in delete_idxs):
-        os.remove(in_path)
-        return jsonify(error="Delete page out of range"), 400
 
     # Build new page order by skipping those indices
     keep_indices = [i for i in range(num_pages) if i not in set(delete_idxs)]
@@ -2271,6 +2641,7 @@ def delete_pages():
 
 # ── Route: Reorder pages ─────────────────────────────────────────────────────────
 @app.post("/api/reorder-pages")
+@limiter.limit("10 per minute")
 def reorder_pages():
     """
     Reorder Pages endpoint:
@@ -2300,13 +2671,31 @@ def reorder_pages():
         reader = PdfReader(in_path)
     except Exception as e:
         os.remove(in_path)
-        return jsonify(error=f"Cannot read PDF: {e}"), 400
+        # Check if it's a PDF-specific error
+        error_msg = "Invalid or corrupted PDF file"
+        if app.config.get('DEBUG'):
+            error_msg = f"Cannot read PDF: {str(e)}"
+        return jsonify(error=error_msg), 400
 
     num_pages = len(reader.pages)
+    
+    # Validate PDF structure
+    MAX_PAGES = 10000
+    if num_pages > MAX_PAGES:
+        os.remove(in_path)
+        return jsonify(error=f"PDF has too many pages (max {MAX_PAGES})"), 400
+    if num_pages < 1:
+        os.remove(in_path)
+        return jsonify(error="Invalid PDF: no pages found"), 400
+    
     # Parse order_str → zero-based list
     try:
         new_order = [int(x) - 1 for x in order_str.split(",")]
-    except ValueError:
+        # Validate no integer overflow
+        if any(not isinstance(idx, int) or idx > sys.maxsize or idx < -sys.maxsize for idx in new_order):
+            os.remove(in_path)
+            return jsonify(error="Invalid page number"), 400
+    except (ValueError, OverflowError) as e:
         os.remove(in_path)
         return jsonify(error="Invalid order format. Use e.g. 3,1,2"), 400
 
@@ -2384,15 +2773,31 @@ def contact():
         return jsonify({'message': 'Email sent successfully'}), 200
 
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        error_logger.error(f"Contact form error: {str(e)}", exc_info=True)
+        if app.config.get('DEBUG'):
+            return jsonify({'error': str(e)}), 500
+        return jsonify({'error': 'Failed to send message'}), 500
 
 @app.errorhandler(413)
 def file_too_large(e):
     return jsonify(error="File too large (max 100 MB)"), 413
 
+@app.errorhandler(Exception)
+def handle_error(e):
+    """Global error handler to prevent information disclosure."""
+    # Log full error with traceback internally
+    error_logger.error(f"Error: {str(e)}", exc_info=True)
+    
+    # Return generic message to client (only detailed in DEBUG mode)
+    if app.config.get('DEBUG'):
+        return jsonify({'error': str(e)}), 500
+    return jsonify({'error': 'An error occurred processing your request'}), 500
+
 # ── AI Tools Endpoints ──────────────────────────────────────────────────────
 
 @app.route("/api/ai-chat-pdf", methods=["POST"])
+@limiter.limit("5 per minute")
+@with_timeout(300)  # 300 seconds for AI operations
 def ai_chat_pdf():
     """AI Chat with PDF - allows users to ask questions about PDF content with full document extraction and citations."""
     try:
@@ -2407,7 +2812,24 @@ def ai_chat_pdf():
             return jsonify({"error": "Invalid file type. Only PDF files are allowed."}), 400
         
         # Extract full text from PDF with page mapping
-        pdf_reader = PdfReader(file)
+        try:
+            pdf_reader = PdfReader(file)
+            # Validate PDF structure
+            num_pages = len(pdf_reader.pages)
+            if num_pages > 10000:
+                return jsonify({"error": "PDF has too many pages (max 10000)"}), 400
+            if num_pages < 1:
+                return jsonify({"error": "Invalid PDF: no pages found"}), 400
+        except PdfReadError as e:
+            error_logger.warning(f"PdfReadError: {str(e)}")
+            return jsonify({"error": "Invalid or corrupted PDF file"}), 400
+        except Exception as e:
+            error_logger.warning(f"PDF read error: {str(e)}")
+            error_msg = "Invalid or corrupted PDF file"
+            if app.config.get('DEBUG'):
+                error_msg = f"Cannot read PDF: {str(e)}"
+            return jsonify({"error": error_msg}), 400
+        
         pages_data = []
         full_text = ""
         
@@ -2419,8 +2841,24 @@ def ai_chat_pdf():
             })
             full_text += f"\n[Page {page_num}]\n{page_text}\n"
         
-        # Get question from request
-        question = request.form.get('question', 'Tell me about this PDF')
+        # PII detection and optional redaction before AI processing
+        REQUIRE_PII_REDACTION = os.getenv("REQUIRE_PII_REDACTION", "false").lower() == "true"
+        pii_detected = detect_pii(full_text)
+        if pii_detected and any(pii_detected.values()):
+            error_logger.info(f"PII detected in PDF: {list(pii_detected.keys())}")
+            if REQUIRE_PII_REDACTION:
+                full_text = redact_pii(full_text)
+                error_logger.info("PII redacted before AI processing")
+        
+        # Validate and get question from request
+        try:
+            schema = ChatRequestSchema()
+            data = schema.load({'question': request.form.get('question', 'Tell me about this PDF')})
+            question_raw = data['question']
+            # Sanitize to prevent prompt injection
+            question = sanitize_prompt_input(question_raw)
+        except ValidationError as err:
+            return jsonify({"error": err.messages}), 400
         
         # Debug logging
         print(f"DEBUG: PDF has {len(pdf_reader.pages)} pages, extracted {len(full_text)} characters")
@@ -2487,9 +2925,14 @@ Provide a detailed answer and cite specific page numbers where relevant informat
         return jsonify(ai_response)
         
     except Exception as e:
-        return jsonify({"error": f"AI Chat failed: {str(e)}"}), 500
+        error_logger.error(f"AI Chat error: {str(e)}", exc_info=True)
+        if app.config.get('DEBUG'):
+            return jsonify({"error": f"AI Chat failed: {str(e)}"}), 500
+        return jsonify({"error": "AI Chat failed. Please try again."}), 500
 
 @app.route("/api/ai-explain-pdf", methods=["POST"])
+@limiter.limit("5 per minute")
+@with_timeout(300)  # 300 seconds for AI operations
 def ai_explain_pdf():
     """AI Explain PDF - provides a comprehensive explanation of PDF content."""
     try:
@@ -2504,15 +2947,39 @@ def ai_explain_pdf():
             return jsonify({"error": "Invalid file type. Only PDF files are allowed."}), 400
         
         # Extract text from PDF for AI processing
-        pdf_reader = PdfReader(file)
-        text_content = ""
+        try:
+            pdf_reader = PdfReader(file)
+            # Validate PDF structure
+            num_pages = len(pdf_reader.pages)
+            if num_pages > 10000:
+                return jsonify({"error": "PDF has too many pages (max 10000)"}), 400
+            if num_pages < 1:
+                return jsonify({"error": "Invalid PDF: no pages found"}), 400
+        except PdfReadError as e:
+            error_logger.warning(f"PdfReadError: {str(e)}")
+            return jsonify({"error": "Invalid or corrupted PDF file"}), 400
+        except Exception as e:
+            error_logger.warning(f"PDF read error: {str(e)}")
+            error_msg = "Invalid or corrupted PDF file"
+            if app.config.get('DEBUG'):
+                error_msg = f"Cannot read PDF: {str(e)}"
+            return jsonify({"error": error_msg}), 400
         
+        text_content = ""
         for page in pdf_reader.pages:
             text_content += page.extract_text() + "\n"
         
-        # Read domain/detail preferences
-        domain = (request.form.get("domain") or "general").lower().strip()
-        detail = (request.form.get("detail") or "basic").lower().strip()  # basic | advanced
+        # Validate domain/detail preferences
+        try:
+            schema = ExplainRequestSchema()
+            data = schema.load({
+                'domain': request.form.get("domain", "general"),
+                'detail': request.form.get("detail", "basic")
+            })
+            domain = data.get('domain', 'general').lower().strip()
+            detail = data.get('detail', 'basic').lower().strip()
+        except ValidationError as err:
+            return jsonify({"error": err.messages}), 400  # basic | advanced
         
         domain_instructions = {
             "legal": (
@@ -2601,7 +3068,10 @@ STRICT RULES:
         return jsonify(ai_explanation)
         
     except Exception as e:
-        return jsonify({"error": f"AI Explanation failed: {str(e)}"}), 500
+        error_logger.error(f"AI Explanation error: {str(e)}", exc_info=True)
+        if app.config.get('DEBUG'):
+            return jsonify({"error": f"AI Explanation failed: {str(e)}"}), 500
+        return jsonify({"error": "AI Explanation failed. Please try again."}), 500
 
 @app.route("/api/ai-ask-pdf", methods=["POST"])
 def ai_ask_pdf():
@@ -2621,9 +3091,25 @@ def ai_ask_pdf():
         question = request.form.get("question", "What is this document about?")
         
         # Extract text from PDF for AI processing
-        pdf_reader = PdfReader(file)
-        text_content = ""
+        try:
+            pdf_reader = PdfReader(file)
+            # Validate PDF structure
+            num_pages = len(pdf_reader.pages)
+            if num_pages > 10000:
+                return jsonify({"error": "PDF has too many pages (max 10000)"}), 400
+            if num_pages < 1:
+                return jsonify({"error": "Invalid PDF: no pages found"}), 400
+        except PdfReadError as e:
+            error_logger.warning(f"PdfReadError: {str(e)}")
+            return jsonify({"error": "Invalid or corrupted PDF file"}), 400
+        except Exception as e:
+            error_logger.warning(f"PDF read error: {str(e)}")
+            error_msg = "Invalid or corrupted PDF file"
+            if app.config.get('DEBUG'):
+                error_msg = f"Cannot read PDF: {str(e)}"
+            return jsonify({"error": error_msg}), 400
         
+        text_content = ""
         for page in pdf_reader.pages:
             text_content += page.extract_text() + "\n"
         
@@ -2660,9 +3146,14 @@ RETURN JSON with fields: question, answer, confidence, suggested_followup (array
         return jsonify(ai_answer)
         
     except Exception as e:
-        return jsonify({"error": f"AI Question failed: {str(e)}"}), 500
+        error_logger.error(f"AI Question error: {str(e)}", exc_info=True)
+        if app.config.get('DEBUG'):
+            return jsonify({"error": f"AI Question failed: {str(e)}"}), 500
+        return jsonify({"error": "AI Question failed. Please try again."}), 500
 
 @app.route("/api/ai-summarize-pdf", methods=["POST"])
+@limiter.limit("5 per minute")
+@with_timeout(300)  # 300 seconds for AI operations
 def ai_summarize_pdf():
     """AI Summarize PDF - provides a comprehensive summary of PDF content."""
     try:
@@ -2677,9 +3168,25 @@ def ai_summarize_pdf():
             return jsonify({"error": "Invalid file type. Only PDF files are allowed."}), 400
         
         # Extract text from PDF for AI processing
-        pdf_reader = PdfReader(file)
-        text_content = ""
+        try:
+            pdf_reader = PdfReader(file)
+            # Validate PDF structure
+            num_pages = len(pdf_reader.pages)
+            if num_pages > 10000:
+                return jsonify({"error": "PDF has too many pages (max 10000)"}), 400
+            if num_pages < 1:
+                return jsonify({"error": "Invalid PDF: no pages found"}), 400
+        except PdfReadError as e:
+            error_logger.warning(f"PdfReadError: {str(e)}")
+            return jsonify({"error": "Invalid or corrupted PDF file"}), 400
+        except Exception as e:
+            error_logger.warning(f"PDF read error: {str(e)}")
+            error_msg = "Invalid or corrupted PDF file"
+            if app.config.get('DEBUG'):
+                error_msg = f"Cannot read PDF: {str(e)}"
+            return jsonify({"error": error_msg}), 400
         
+        text_content = ""
         for page in pdf_reader.pages:
             text_content += page.extract_text() + "\n"
         
@@ -2786,9 +3293,14 @@ STRICT RULES:
         return jsonify(ai_summary)
         
     except Exception as e:
-        return jsonify({"error": f"AI Summarization failed: {str(e)}"}), 500
+        error_logger.error(f"AI Summarization error: {str(e)}", exc_info=True)
+        if app.config.get('DEBUG'):
+            return jsonify({"error": f"AI Summarization failed: {str(e)}"}), 500
+        return jsonify({"error": "AI Summarization failed. Please try again."}), 500
 
 @app.post("/api/ai-document-synthesis")
+@limiter.limit("5 per minute")
+@with_timeout(300)  # 300 seconds for AI operations
 def ai_document_synthesis():
     """Synthesize multiple PDFs into a single consolidated document.
     - Accepts multiple files under field name "files"
@@ -2807,6 +3319,11 @@ def ai_document_synthesis():
             return jsonify({"error": "Upload at least one PDF file"}), 400
         if any(not allowed_pdf(f) for f in files):
             return jsonify({"error": "Only PDF files are allowed"}), 400
+        
+        # Validate request size for synthesis
+        is_valid, error_msg = validate_request_size(files)
+        if not is_valid:
+            return jsonify({"error": error_msg}), 400
 
         target_format = (request.form.get("format") or "report").lower().strip()
         if target_format not in ("report", "brief", "minutes"):
@@ -2826,7 +3343,12 @@ def ai_document_synthesis():
         template_profile = (request.form.get("template_profile") or "").lower().strip() or None
         if template_profile and template_profile not in ("executive_summary", "risk_assessment", "compliance_review"):
             return jsonify({"error": "template_profile must be one of: executive_summary|risk_assessment|compliance_review"}), 400
-        custom_instructions = (request.form.get("custom_instructions") or "").strip() or None
+        custom_instructions_raw = (request.form.get("custom_instructions") or "").strip() or None
+        # Sanitize custom instructions to prevent prompt injection
+        if custom_instructions_raw:
+            custom_instructions = sanitize_prompt_input(custom_instructions_raw, max_length=1000)
+        else:
+            custom_instructions = None
         output_format = (request.form.get("output_format") or "pdf").lower().strip()
         if output_format not in ("pdf", "docx", "pptx", "teams"):
             return jsonify({"error": "output_format must be one of: pdf|docx|pptx|teams"}), 400
@@ -3317,7 +3839,10 @@ def ai_document_synthesis():
             return jsonify({"status": "ok", "delivered": True})
 
     except Exception as e:
-        return jsonify({"error": f"Synthesis failed: {str(e)}"}), 500
+        error_logger.error(f"Synthesis error: {str(e)}", exc_info=True)
+        if app.config.get('DEBUG'):
+            return jsonify({"error": f"Synthesis failed: {str(e)}"}), 500
+        return jsonify({"error": "Document synthesis failed. Please try again."}), 500
 
 
 @app.post("/api/ai-document-synthesis/async")
@@ -3329,6 +3854,11 @@ def ai_document_synthesis_async():
             return jsonify({"error": "Upload at least one PDF file"}), 400
         if any(not allowed_pdf(f) for f in files):
             return jsonify({"error": "Only PDF files are allowed"}), 400
+        
+        # Validate request size for synthesis
+        is_valid, error_msg = validate_request_size(files)
+        if not is_valid:
+            return jsonify({"error": error_msg}), 400
 
         # Validate parameters
         target_format = (request.form.get("format") or "report").lower().strip()
@@ -3350,7 +3880,12 @@ def ai_document_synthesis_async():
         if template_profile and template_profile not in ("executive_summary", "risk_assessment", "compliance_review"):
             return jsonify({"error": "template_profile must be one of: executive_summary|risk_assessment|compliance_review"}), 400
             
-        custom_instructions = (request.form.get("custom_instructions") or "").strip() or None
+        custom_instructions_raw = (request.form.get("custom_instructions") or "").strip() or None
+        # Sanitize custom instructions to prevent prompt injection
+        if custom_instructions_raw:
+            custom_instructions = sanitize_prompt_input(custom_instructions_raw, max_length=1000)
+        else:
+            custom_instructions = None
         output_format = (request.form.get("output_format") or "pdf").lower().strip()
         if output_format not in ("pdf", "docx", "pptx", "teams"):
             return jsonify({"error": "output_format must be one of: pdf|docx|pptx|teams"}), 400
@@ -3591,7 +4126,10 @@ def ai_document_synthesis_async():
         return jsonify({"job_id": job_id}), 202
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        error_logger.error(f"Extract error: {str(e)}", exc_info=True)
+        if app.config.get('DEBUG'):
+            return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Extraction failed. Please try again."}), 500
 
 
 @app.get("/api/ai-document-synthesis/status/<job_id>")
@@ -3688,6 +4226,7 @@ def _fallback_extract(temp_path: str, options: ExtractionOptions) -> dict:
         return {"error": f"Fallback extraction failed: {str(e)}"}
 
 @app.post("/api/extract")
+@limiter.limit("5 per minute")
 def api_extract():
     """MVP extraction endpoint: returns detected document type and basic entities.
     Input: multipart/form-data with 'file' (PDF)
@@ -3707,18 +4246,31 @@ def api_extract():
         temp_path = os.path.join(app.config["UPLOAD_FOLDER"], f"{uuid.uuid4()}_{fname}")
         file.save(temp_path)
 
-        # Parse request parameters into ExtractionOptions
+        # Parse and validate request parameters into ExtractionOptions
         try:
             selected_fields = json.loads(request.form.get('selected_fields') or '[]')
             if not isinstance(selected_fields, list):
                 selected_fields = []
         except Exception:
             selected_fields = []
+        
+        try:
+            extract_schema = ExtractRequestSchema()
+            extract_data = extract_schema.load({
+                'domain': request.form.get('domain_override', ''),
+                'selected_fields': selected_fields,
+                'custom_instructions': request.form.get('custom_instructions', ''),
+                'export_format': request.form.get('export_format', 'json')
+            })
+            validated_domain = extract_data.get('domain') or request.form.get('domain_override')
+            validated_custom_instructions = extract_data.get('custom_instructions') or ''
+        except ValidationError as err:
+            return jsonify({"error": err.messages}), 400
 
         options = ExtractionOptions(
-            domain_override=request.form.get('domain_override'),
-            selected_fields=selected_fields,
-            custom_instructions=request.form.get('custom_instructions', ''),
+            domain_override=validated_domain,
+            selected_fields=extract_data.get('selected_fields', []),
+            custom_instructions=sanitize_prompt_input(validated_custom_instructions, max_length=1000) if validated_custom_instructions else '',
             enrich=request.form.get('enrich', '').lower() in ('1', 'true', 'yes'),
             extract_tables=request.form.get('extract_tables', '').lower() in ('1', 'true', 'yes'),
             extract_formulas=request.form.get('extract_formulas', '').lower() in ('1', 'true', 'yes')
@@ -3743,7 +4295,10 @@ def api_extract():
 
         return jsonify(resp_json)
     except Exception as e:
-        return jsonify({"error": f"Extraction failed: {str(e)}"}), 500
+        error_logger.error(f"Extraction error: {str(e)}", exc_info=True)
+        if app.config.get('DEBUG'):
+            return jsonify({"error": f"Extraction failed: {str(e)}"}), 500
+        return jsonify({"error": "Extraction failed. Please try again."}), 500
 
 @app.post("/api/extract/async")
 def api_extract_async():
