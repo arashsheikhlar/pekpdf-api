@@ -37,11 +37,11 @@ class ExtractRequestSchema(Schema):
         validate=validate.Length(max=1000),
         error_messages={'invalid': 'Custom instructions must be a string'}
     )
-    use_ocr = fields.Bool(required=False, missing=False)
+    use_ocr = fields.Bool(required=False, load_default=False)
     export_format = fields.Str(
         required=False,
         validate=validate.OneOf(['json', 'csv', 'pdf']),
-        missing='json',
+        load_default='json',
         error_messages={'invalid': 'Export format must be json, csv, or pdf'}
     )
 
@@ -85,13 +85,13 @@ class ExplainRequestSchema(Schema):
         required=False,
         allow_none=True,
         validate=validate.Length(min=1, max=50),
-        missing='general',
+        load_default='general',
         error_messages={'invalid': 'Domain must be a valid string'}
     )
     detail = fields.Str(
         required=False,
         validate=validate.OneOf(['basic', 'advanced', 'executive']),
-        missing='basic',
+        load_default='basic',
         error_messages={'invalid': 'Detail must be basic, advanced, or executive'}
     )
 

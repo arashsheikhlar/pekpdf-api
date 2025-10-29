@@ -15,8 +15,19 @@ from flask import (
     Flask, request, send_file, jsonify, after_this_request
 )
 from flask_cors import CORS                 # allow front-end origin
-from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
+try:
+    from flask_limiter import Limiter
+    from flask_limiter.util import get_remote_address
+    _RATE_LIMITING_AVAILABLE = True
+except Exception as e:
+    _RATE_LIMITING_AVAILABLE = False
+    Limiter = None  # type: ignore
+    def get_remote_address():
+        try:
+            return request.remote_addr
+        except Exception:
+            return None
+    print(f"Warning: flask-limiter unavailable or failed to import: {e}. Rate limiting disabled.")
 from werkzeug.utils import secure_filename
 from validators import (
     ChatRequestSchema, ExtractRequestSchema, PageRangeSchema,
@@ -24,14 +35,21 @@ from validators import (
 )
 from marshmallow import ValidationError
 from common.security import detect_pii, redact_pii
-from PyPDF2 import PdfMerger, PdfReader, PdfWriter, PdfReadError   # ← PdfReader/Writer for split
+from PyPDF2 import PdfMerger, PdfReader, PdfWriter   # ← PdfReader/Writer for split
+from PyPDF2.errors import PdfReadError
 from datetime import datetime, timedelta
 import mimetypes, os, uuid, io, re, zipfile
 import subprocess, shlex          # run Ghostscript
 import shutil, platform
 from pdf2docx import Converter
 from PIL import Image           # for JPG/PNG → PDF
-import fitz                     # PyMuPDF, for PDF → JPG/PNG
+try:
+    import fitz                 # PyMuPDF, for PDF → JPG/PNG
+    _PYMUPDF_AVAILABLE = True
+except Exception as e:
+    _PYMUPDF_AVAILABLE = False
+    fitz = None  # type: ignore
+    print(f"Warning: PyMuPDF (fitz) not available: {e}. PDF→image features disabled.")
 from pdfminer.high_level import extract_text_to_fp
 from pdfminer.layout import LAParams
 import pdfplumber
@@ -853,12 +871,29 @@ CORS(
 )
 
 # ── Rate Limiting ──────────────────────────────────────────────
-limiter = Limiter(
-    app=app,
-    key_func=get_remote_address,
-    default_limits=["200 per day", "50 per hour"],
-    storage_uri="memory://"
-)
+if _RATE_LIMITING_AVAILABLE:
+    limiter = Limiter(
+        app=app,
+        key_func=get_remote_address,
+        default_limits=["200 per day", "50 per hour"],
+        storage_uri="memory://"
+    )
+else:
+    print("Warning: flask-limiter not available; proceeding without rate limiting.")
+    class _NoopLimiter:
+        def limit(self, *args, **kwargs):
+            def decorator(f):
+                return f
+            return decorator
+        def shared_limit(self, *args, **kwargs):
+            return self.limit(*args, **kwargs)
+        def exempt(self, f):
+            return f
+        def request_filter(self, *args, **kwargs):
+            def decorator(f):
+                return f
+            return decorator
+    limiter = _NoopLimiter()
 
 # ── Security Headers ───────────────────────────────────────────
 @app.after_request

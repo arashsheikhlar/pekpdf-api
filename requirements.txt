@@ -4,7 +4,10 @@ Flask-Limiter==3.5.0
 PyPDF2==3.0.1
 pdf2docx==0.5.8
 Pillow==10.4.0
-PyMuPDF==1.24.0
+# PyMuPDF (fitz) is optional at runtime and can be installed separately.
+# Commented out to unblock installs on Windows when no matching wheel is available.
+# Install later with a matching wheel for your Python version (see instructions).
+# PyMuPDF==1.24.0
 pdfminer.six==20221105
 pdfplumber==0.10.2
 python-dotenv==1.0.0
